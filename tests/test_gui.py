@@ -35,9 +35,11 @@ class GuiSupportTest(unittest.TestCase):
 
     def test_window_constructs_without_a_display(self):
         from bms_reuse.gui import CLASS_LABELS, MainWindow, localize_progress
+        from PySide6.QtWidgets import QLabel
 
         window = MainWindow()
         self.assertEqual(window.windowTitle(), "ステムリユース · BMSステム再利用解析")
+        self.assertNotIn("ヒットを検出・音色を比較", " ".join(label.text() for label in window.findChildren(QLabel)))
         self.assertEqual(window.open_folder_button.text(), "サンプルフォルダを開く")
         self.assertEqual(window.hit_table.horizontalHeaderItem(2).text(), "分類")
         self.assertEqual(window.theme_combo.currentText(), "ダーク")
