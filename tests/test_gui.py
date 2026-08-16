@@ -34,10 +34,39 @@ class GuiSupportTest(unittest.TestCase):
             self.assertIn("sample_", rows[0]["sample_id"])
 
     def test_window_constructs_without_a_display(self):
-        from bms_reuse.gui import MainWindow
+        from bms_reuse.gui import CLASS_LABELS, MainWindow, localize_progress
 
         window = MainWindow()
-        self.assertEqual(window.windowTitle(), "StemReuse · BMS Stem Reuse Analyzer")
+        self.assertEqual(window.windowTitle(), "ステムリユース · BMSステム再利用解析")
+        self.assertEqual(window.open_folder_button.text(), "サンプルフォルダを開く")
+        self.assertEqual(window.hit_table.horizontalHeaderItem(2).text(), "分類")
+        self.assertEqual(window.theme_combo.currentText(), "ダーク")
+        self.assertEqual(window.theme_combo.currentData(), "Dark")
+        self.assertEqual(window.instrument_combo.currentData(), "kick")
+        self.assertEqual(window.filter_combo.itemData(2), "SAME")
+        self.assertEqual(CLASS_LABELS["SAME"], "同一")
+        self.assertEqual(CLASS_LABELS["GAIN_VARIANT"], "音量違い")
+        self.assertEqual(CLASS_LABELS["DIFFERENT"], "別音")
+        self.assertEqual(CLASS_LABELS["UNSURE"], "判定保留")
+        self.assertEqual(CLASS_LABELS["OVERLAP"], "音の重なり")
+        self.assertEqual(localize_progress("Analysis complete"), "解析完了")
+        self.assertEqual(localize_progress("Extracting 12 hits"), "12個のヒットを切り出し中")
+        visible_text = " ".join(
+            [
+                window.windowTitle(),
+                window.drop_zone.title.text(),
+                window.drop_zone.hint.text(),
+                window.analyze_button.text(),
+                window.cancel_button.text(),
+                window.status_label.text(),
+                window.required_card.caption.text(),
+                window.hits_card.caption.text(),
+                window.reuse_card.caption.text(),
+                window.review_card.caption.text(),
+            ]
+        )
+        for forbidden in ("Open WAV", "Analyze", "Cancel", "Ready", "Analysis", "Required", "Detected", "Review"):
+            self.assertNotIn(forbidden, visible_text)
         self.assertFalse(window.cancel_button.isEnabled())
         window.close()
 

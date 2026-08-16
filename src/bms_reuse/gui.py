@@ -14,7 +14,7 @@ from pathlib import Path
 
 try:
     from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSettings, QSize, QThread, Qt, Signal, Slot
-    from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPen, QShortcut
+    from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase, QKeySequence, QPainter, QPen, QShortcut
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -36,6 +36,7 @@ try:
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
+        QScrollArea,
         QSizePolicy,
         QSpinBox,
         QSplitter,
@@ -67,16 +68,57 @@ CLASS_COLORS = {
 }
 
 CLASS_LABELS = {
-    "BASE": "Base sample",
-    "SAME": "Same",
-    "GAIN_VARIANT": "Gain only",
-    "DIFFERENT": "Different",
-    "UNSURE": "Review",
-    "OVERLAP": "Overlap",
+    "BASE": "基準サンプル",
+    "SAME": "同一",
+    "GAIN_VARIANT": "音量違い",
+    "DIFFERENT": "別音",
+    "UNSURE": "判定保留",
+    "OVERLAP": "音の重なり",
 }
 
+FILTER_LABELS = {
+    "All": "すべて",
+    "BASE": "基準サンプル",
+    "SAME": "同一",
+    "GAIN_VARIANT": "音量違い",
+    "DIFFERENT": "別音",
+    "UNSURE": "判定保留",
+    "OVERLAP": "音の重なり",
+}
+
+INSTRUMENT_LABELS = {
+    "kick": "キック",
+    "snare": "スネア",
+    "clap": "クラップ",
+    "hihat": "ハイハット",
+    "other": "その他",
+}
+
+
+def localize_progress(message: str) -> str:
+    """Translate worker stage messages without changing core/JSON identifiers."""
+    if message == "Loading audio":
+        return "音声を読み込み中"
+    if message == "Detecting onsets":
+        return "オンセットを検出中"
+    if message.startswith("Extracting ") and message.endswith(" hits"):
+        return f"{message[11:-5]}個のヒットを切り出し中"
+    if message == "Extracting features":
+        return "特徴量を抽出中"
+    if message == "Comparing and clustering hits":
+        return "比較・クラスタリング中"
+    if message == "Writing analysis JSON":
+        return "解析JSONを書き出し中"
+    if message == "Writing representative samples":
+        return "代表サンプルを書き出し中"
+    if message == "Writing event CSV":
+        return "イベントCSVを書き出し中"
+    if message == "Analysis complete":
+        return "解析完了"
+    return message
+
 DARK_STYLE = """
-QMainWindow, QWidget { background: #0b1020; color: #e5e7eb; font-family: "Segoe UI"; font-size: 10pt; }
+QMainWindow, QWidget { background: #0b1020; color: #e5e7eb; font-family: "Yu Gothic UI", "Meiryo UI", "Segoe UI"; font-size: 10pt; }
 QFrame#Panel, QFrame#DropZone, QGroupBox { background: #111827; border: 1px solid #26344a; border-radius: 10px; }
 QFrame#DropZone { border: 1px dashed #3b82f6; background: #0e1729; }
 QFrame#DropZone[dragActive="true"] { background: #102442; border: 1px solid #38bdf8; }
@@ -177,7 +219,7 @@ class AnalysisWorker(QThread):
         self.cancel_event.set()
 
     def _on_progress(self, percent: int, message: str) -> None:
-        self.progress.emit(max(0, min(100, percent)), message)
+        self.progress.emit(max(0, min(100, percent)), localize_progress(message))
 
     def run(self) -> None:  # noqa: D401 - Qt thread entry point
         try:
@@ -229,10 +271,10 @@ class DropZone(QFrame):
         self.icon = QLabel("◈")
         self.icon.setAlignment(Qt.AlignCenter)
         self.icon.setStyleSheet("color:#38bdf8;font-size:25pt;font-weight:700;")
-        self.title = QLabel("Drop a WAV stem here")
+        self.title = QLabel("WAVステムをここにドロップ")
         self.title.setObjectName("DropTitle")
         self.title.setAlignment(Qt.AlignCenter)
-        self.hint = QLabel("or press Enter to browse  ·  PCM WAV")
+        self.hint = QLabel("またはEnterで選択  ·  PCM WAV")
         self.hint.setObjectName("DropHint")
         self.hint.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.icon)
@@ -287,7 +329,7 @@ class WaveformView(QWidget):
         self.duration = 0.0
         self.rows: list[dict] = []
         self.selected_id: int | None = None
-        self.setToolTip("Click a hit marker to inspect it")
+        self.setToolTip("ヒットマーカーをクリックして詳細を確認")
 
     def set_result(self, result: AnalysisResult | None) -> None:
         if result is None:
@@ -327,7 +369,7 @@ class WaveformView(QWidget):
         painter.drawLine(rect.left(), rect.center().y(), rect.right(), rect.center().y())
         if not self.rows:
             painter.setPen(QColor("#64748b"))
-            painter.drawText(rect, Qt.AlignCenter, "Analysis timeline · drop a WAV to begin")
+            painter.drawText(rect, Qt.AlignCenter, "解析タイムライン · WAVをドロップして開始")
             return
         for row in self.rows:
             x = rect.left() + round(rect.width() * row["time"] / max(self.duration, 1e-9))
@@ -360,7 +402,7 @@ class MetricCard(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self, initial_path: str | None = None):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} · BMS Stem Reuse Analyzer")
+        self.setWindowTitle("ステムリユース · BMSステム再利用解析")
         self.setMinimumSize(1120, 720)
         self.resize(1440, 900)
         self.setAcceptDrops(True)
@@ -379,7 +421,7 @@ class MainWindow(QMainWindow):
         if initial_path:
             self.set_input_path(initial_path)
         self._set_running(False)
-        self._log("Ready. Drop a WAV stem or press Ctrl+O to choose one.")
+        self._log("準備完了。WAVステムをドロップするか、Ctrl+Oで選択してください。")
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -391,37 +433,38 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         brand_box = QVBoxLayout()
         brand_box.setSpacing(0)
-        brand = QLabel("STEMREUSE")
+        brand = QLabel("ステムリユース")
         brand.setObjectName("Brand")
-        kicker = QLabel("BMS AUDIO INTELLIGENCE")
+        kicker = QLabel("BMS音声解析")
         kicker.setObjectName("Kicker")
         brand_box.addWidget(brand)
         brand_box.addWidget(kicker)
         header.addLayout(brand_box)
         header.addStretch(1)
         self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["Dark", "Light"])
-        self.theme_combo.setToolTip("Switch the application theme")
-        self.theme_combo.currentTextChanged.connect(self._apply_theme)
-        header.addWidget(QLabel("Theme"))
+        self.theme_combo.addItem("ダーク", "Dark")
+        self.theme_combo.addItem("ライト", "Light")
+        self.theme_combo.setToolTip("画面テーマを切り替え")
+        self.theme_combo.currentTextChanged.connect(lambda text: self._apply_theme({"ダーク": "Dark", "ライト": "Light"}.get(text, "Dark")))
+        header.addWidget(QLabel("テーマ"))
         header.addWidget(self.theme_combo)
-        open_button = QPushButton("Open WAV")
-        open_button.setToolTip("Choose a PCM WAV stem (Ctrl+O)")
+        open_button = QPushButton("WAVを開く")
+        open_button.setToolTip("解析するPCM WAVステムを選択（Ctrl+O）")
         open_button.clicked.connect(self._browse_input)
         header.addWidget(open_button)
         root_layout.addLayout(header)
 
         title = QHBoxLayout()
         title_labels = QVBoxLayout()
-        title_label = QLabel("Find the minimum keysound set")
+        title_label = QLabel("最小限のキー音セットを見つける")
         title_label.setObjectName("Title")
-        subtitle = QLabel("Detect hits, compare timbre, and export reusable representatives for BMS.")
+        subtitle = QLabel("ヒットを検出・音色を比較し、BMS用の代表サンプルを書き出します。")
         subtitle.setObjectName("Subtle")
         title_labels.addWidget(title_label)
         title_labels.addWidget(subtitle)
         title.addLayout(title_labels)
         title.addStretch(1)
-        self.status_label = QLabel("Ready")
+        self.status_label = QLabel("準備完了")
         self.status_label.setObjectName("Status")
         title.addWidget(self.status_label, alignment=Qt.AlignTop)
         root_layout.addLayout(title)
@@ -440,16 +483,17 @@ class MainWindow(QMainWindow):
         self.drop_zone.browse_requested.connect(self._browse_input)
         left_layout.addWidget(self.drop_zone)
         self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Input WAV path")
+        self.input_edit.setPlaceholderText("入力WAVのパス")
         self.input_edit.setReadOnly(True)
-        self.input_edit.setToolTip("The source WAV to analyze")
+        self.input_edit.setToolTip("解析する入力WAVファイル")
         left_layout.addWidget(self.input_edit)
 
-        settings_box = QGroupBox("Analysis settings")
+        settings_box = QGroupBox("解析設定")
         settings_form = QFormLayout(settings_box)
         settings_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         self.instrument_combo = QComboBox()
-        self.instrument_combo.addItems(["kick", "snare", "clap", "hihat", "other"])
+        for key, label in INSTRUMENT_LABELS.items():
+            self.instrument_combo.addItem(label, key)
         self.threshold_spin = self._double_spin(0.995, 0.0, 1.0, 0.001, 3)
         self.spectral_spin = self._double_spin(0.92, 0.0, 1.0, 0.001, 3)
         self.onset_spin = self._double_spin(0.35, 0.0, 1.0, 0.01, 2)
@@ -462,42 +506,42 @@ class MainWindow(QMainWindow):
         self.subdivision_spin = QSpinBox()
         self.subdivision_spin.setRange(1, 128)
         self.subdivision_spin.setValue(16)
-        settings_form.addRow("Instrument", self.instrument_combo)
-        settings_form.addRow("Same threshold", self.threshold_spin)
-        settings_form.addRow("Spectral threshold", self.spectral_spin)
-        settings_form.addRow("Onset threshold", self.onset_spin)
-        settings_form.addRow("Min separation", self.separation_spin)
-        settings_form.addRow("Pre-roll", self.pre_roll_spin)
-        settings_form.addRow("Window", self.window_spin)
-        settings_form.addRow("BPM (optional)", self.bpm_spin)
-        settings_form.addRow("Grid offset", self.offset_spin)
-        settings_form.addRow("Subdivision", self.subdivision_spin)
-        settings_form.addRow("Max alignment", self.alignment_spin)
+        settings_form.addRow("楽器", self.instrument_combo)
+        settings_form.addRow("同一判定しきい値", self.threshold_spin)
+        settings_form.addRow("スペクトルしきい値", self.spectral_spin)
+        settings_form.addRow("オンセットしきい値", self.onset_spin)
+        settings_form.addRow("最小間隔", self.separation_spin)
+        settings_form.addRow("プリロール", self.pre_roll_spin)
+        settings_form.addRow("ウィンドウ長", self.window_spin)
+        settings_form.addRow("BPM（任意）", self.bpm_spin)
+        settings_form.addRow("グリッドオフセット", self.offset_spin)
+        settings_form.addRow("分割数", self.subdivision_spin)
+        settings_form.addRow("最大アライメント", self.alignment_spin)
         left_layout.addWidget(settings_box)
 
-        output_box = QGroupBox("Output")
+        output_box = QGroupBox("出力")
         output_layout = QVBoxLayout(output_box)
         self.json_edit = QLineEdit()
         self.samples_edit = QLineEdit()
         self.csv_edit = QLineEdit()
-        self.csv_check = QCheckBox("Write event CSV")
+        self.csv_check = QCheckBox("イベントCSVを書き出す")
         self.csv_check.setChecked(True)
-        self.samples_check = QCheckBox("Export representative WAVs")
+        self.samples_check = QCheckBox("代表WAVを書き出す")
         self.samples_check.setChecked(True)
         output_layout.addWidget(self._path_row("JSON", self.json_edit, self._browse_json))
-        output_layout.addWidget(self._path_row("Samples", self.samples_edit, self._browse_samples))
+        output_layout.addWidget(self._path_row("サンプル", self.samples_edit, self._browse_samples))
         output_layout.addWidget(self._path_row("CSV", self.csv_edit, self._browse_csv))
         output_layout.addWidget(self.samples_check)
         output_layout.addWidget(self.csv_check)
         left_layout.addWidget(output_box)
 
         action_row = QHBoxLayout()
-        self.analyze_button = QPushButton("Analyze stem")
+        self.analyze_button = QPushButton("解析を開始")
         self.analyze_button.setObjectName("Primary")
         self.analyze_button.setMinimumHeight(38)
-        self.analyze_button.setToolTip("Start analysis (Ctrl+Enter)")
+        self.analyze_button.setToolTip("解析を開始（Ctrl+Enter）")
         self.analyze_button.clicked.connect(self.start_analysis)
-        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button = QPushButton("キャンセル")
         self.cancel_button.setObjectName("Danger")
         self.cancel_button.setMinimumHeight(38)
         self.cancel_button.clicked.connect(self.cancel_analysis)
@@ -509,15 +553,19 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         left_layout.addWidget(self.progress_bar)
 
-        log_group = QGroupBox("Activity log")
+        log_group = QGroupBox("処理ログ")
         log_layout = QVBoxLayout(log_group)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(600)
         self.log_view.setMinimumHeight(110)
         log_layout.addWidget(self.log_view)
-        left_layout.addWidget(log_group, 1)
-        splitter.addWidget(left)
+        left_layout.addWidget(log_group)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setWidget(left)
+        splitter.addWidget(left_scroll)
 
         right = QFrame()
         right_layout = QVBoxLayout(right)
@@ -530,10 +578,10 @@ class MainWindow(QMainWindow):
 
         metrics = QGridLayout()
         metrics.setSpacing(8)
-        self.required_card = MetricCard("Required samples", "#67e8f9")
-        self.hits_card = MetricCard("Detected hits", "#60a5fa")
-        self.reuse_card = MetricCard("Reuse ratio", "#34d399")
-        self.review_card = MetricCard("Needs review", "#fbbf24")
+        self.required_card = MetricCard("必要サンプル数", "#67e8f9")
+        self.hits_card = MetricCard("検出ヒット数", "#60a5fa")
+        self.reuse_card = MetricCard("再利用率", "#34d399")
+        self.review_card = MetricCard("要確認", "#fbbf24")
         metrics.addWidget(self.required_card, 0, 0)
         metrics.addWidget(self.hits_card, 0, 1)
         metrics.addWidget(self.reuse_card, 0, 2)
@@ -546,21 +594,22 @@ class MainWindow(QMainWindow):
         table_layout = QVBoxLayout(table_panel)
         table_layout.setContentsMargins(0, 0, 0, 0)
         filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Review hits"))
+        filter_row.addWidget(QLabel("ヒット一覧"))
         self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["All", "BASE", "SAME", "GAIN_VARIANT", "DIFFERENT", "UNSURE", "OVERLAP"])
-        self.filter_combo.currentTextChanged.connect(self._refresh_table)
+        for key, label in FILTER_LABELS.items():
+            self.filter_combo.addItem(label, key)
+        self.filter_combo.currentIndexChanged.connect(self._refresh_table)
         filter_row.addWidget(self.filter_combo)
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Filter by hit ID or time…")
+        self.search_edit.setPlaceholderText("ヒット番号または時刻で絞り込み…")
         self.search_edit.textChanged.connect(self._refresh_table)
         filter_row.addWidget(self.search_edit, 1)
-        self.open_folder_button = QPushButton("Open samples")
+        self.open_folder_button = QPushButton("サンプルフォルダを開く")
         self.open_folder_button.clicked.connect(self._open_samples_folder)
         filter_row.addWidget(self.open_folder_button)
         table_layout.addLayout(filter_row)
         self.hit_table = QTableWidget(0, 7)
-        self.hit_table.setHorizontalHeaderLabels(["Hit", "Time", "Class", "Confidence", "Gain", "Sample", "Flags"])
+        self.hit_table.setHorizontalHeaderLabels(["番号", "時刻", "分類", "信頼度", "音量差", "サンプル", "注意"])
         self.hit_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.hit_table.setSelectionMode(QTableWidget.SingleSelection)
         self.hit_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -578,7 +627,7 @@ class MainWindow(QMainWindow):
         detail_layout = QHBoxLayout(detail_panel)
         detail_layout.setContentsMargins(12, 9, 12, 9)
         detail_box = QVBoxLayout()
-        self.detail_title = QLabel("Select a hit to inspect")
+        self.detail_title = QLabel("ヒットを選択してください")
         self.detail_title.setObjectName("DropTitle")
         self.detail_metrics = QLabel("—")
         self.detail_metrics.setObjectName("Subtle")
@@ -590,12 +639,12 @@ class MainWindow(QMainWindow):
         sample_box = QVBoxLayout()
         self.sample_list = QListWidget()
         self.sample_list.setMaximumHeight(82)
-        sample_box.addWidget(QLabel("Representative samples"))
+        sample_box.addWidget(QLabel("代表サンプル"))
         sample_box.addWidget(self.sample_list)
         button_row = QHBoxLayout()
-        self.play_button = QPushButton("Play selected")
+        self.play_button = QPushButton("選択音を再生")
         self.play_button.clicked.connect(self._play_selected)
-        self.export_folder_button = QPushButton("Show folder")
+        self.export_folder_button = QPushButton("フォルダを表示")
         self.export_folder_button.clicked.connect(self._open_samples_folder)
         button_row.addWidget(self.play_button)
         button_row.addWidget(self.export_folder_button)
@@ -611,7 +660,7 @@ class MainWindow(QMainWindow):
         splitter.setSizes([390, 1000])
 
         status = self.statusBar()
-        status.showMessage("Ready")
+        status.showMessage("準備完了")
 
         self.shortcut_open = QShortcut(QKeySequence("Ctrl+O"), self)
         self.shortcut_open.activated.connect(self._browse_input)
@@ -651,9 +700,11 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self, theme: str) -> None:
         theme = theme if theme in {"Dark", "Light"} else "Dark"
-        if hasattr(self, "theme_combo") and self.theme_combo.currentText() != theme:
+        if hasattr(self, "theme_combo") and self.theme_combo.currentData() != theme:
             self.theme_combo.blockSignals(True)
-            self.theme_combo.setCurrentText(theme)
+            index = self.theme_combo.findData(theme)
+            if index >= 0:
+                self.theme_combo.setCurrentIndex(index)
             self.theme_combo.blockSignals(False)
         QApplication.instance().setStyleSheet(DARK_STYLE if theme == "Dark" else LIGHT_STYLE)
         self.settings_store.setValue("theme", theme)
@@ -665,40 +716,40 @@ class MainWindow(QMainWindow):
     def set_input_path(self, raw_path: str) -> None:
         path = Path(raw_path).expanduser()
         if path.suffix.casefold() != ".wav":
-            self._show_error("Unsupported input", "Please choose a PCM WAV file.")
+            self._show_error("対応していない入力形式", "PCM WAVファイルを選択してください。")
             return
         if not path.exists() or not path.is_file():
-            self._show_error("Input not found", str(path))
+            self._show_error("入力ファイルが見つかりません", str(path))
             return
         path = path.resolve()
         self.input_edit.setText(str(path))
         self.drop_zone.title.setText(path.name)
-        self.drop_zone.hint.setText("PCM WAV ready · press Ctrl+Enter to analyze")
+        self.drop_zone.hint.setText("PCM WAV準備完了 · Ctrl+Enterで解析")
         self.json_edit.setText(str(path.with_suffix(".bra.json")))
         self.samples_edit.setText(str(path.parent / f"{path.stem}_keysounds"))
         self.csv_edit.setText(str(path.with_suffix(".csv")))
-        self._log(f"Input selected: {path}")
+        self._log(f"入力を選択しました: {path}")
 
     def _browse_input(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Choose WAV stem", str(Path(self.input_edit.text()).parent if self.input_edit.text() else Path.home()), "PCM WAV (*.wav)")
+        path, _ = QFileDialog.getOpenFileName(self, "WAVステムを選択", str(Path(self.input_edit.text()).parent if self.input_edit.text() else Path.home()), "PCM WAV (*.wav)")
         if path:
             self.set_input_path(path)
 
     def _browse_json(self) -> None:
         current = self.json_edit.text() or str(Path.home() / "analysis.bra.json")
-        path, _ = QFileDialog.getSaveFileName(self, "Analysis JSON", current, "BMS Analysis (*.bra.json);;JSON (*.json)")
+        path, _ = QFileDialog.getSaveFileName(self, "解析JSONの保存先", current, "BMS解析 (*.bra.json);;JSON (*.json)")
         if path:
             self.json_edit.setText(path)
 
     def _browse_csv(self) -> None:
         current = self.csv_edit.text() or str(Path.home() / "events.csv")
-        path, _ = QFileDialog.getSaveFileName(self, "Event CSV", current, "CSV (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(self, "イベントCSVの保存先", current, "CSV (*.csv)")
         if path:
             self.csv_edit.setText(path)
 
     def _browse_samples(self) -> None:
         current = self.samples_edit.text() or str(Path.home())
-        path = QFileDialog.getExistingDirectory(self, "Representative WAV folder", current)
+        path = QFileDialog.getExistingDirectory(self, "代表WAVフォルダ", current)
         if path:
             self.samples_edit.setText(path)
 
@@ -709,7 +760,7 @@ class MainWindow(QMainWindow):
     def _settings(self) -> dict:
         bpm = self.bpm_spin.value() or None
         return {
-            "instrument": self.instrument_combo.currentText(),
+            "instrument": self.instrument_combo.currentData() or "kick",
             "threshold": self.threshold_spin.value(),
             "spectral_threshold": self.spectral_spin.value(),
             "onset_threshold": self.onset_spin.value(),
@@ -731,12 +782,13 @@ class MainWindow(QMainWindow):
             output["csv"] = self.csv_edit.text().strip()
         for key, target in output.items():
             if target and key != "samples" and self._same_path(target, input_path):
-                raise ValueError(f"{key} output must not overwrite the input WAV")
+                label = {"json": "JSON", "csv": "CSV"}.get(key, key)
+                raise ValueError(f"{label}出力が入力WAVを上書きします")
         sample_dir = output.get("samples")
         if sample_dir:
             input_stem = input_path.stem.casefold()
             if Path(sample_dir).resolve() == input_path.parent.resolve() and input_stem.startswith("sample_") and input_stem[7:].isdigit():
-                raise ValueError("samples output must not overwrite the input WAV")
+                raise ValueError("サンプル出力が入力WAVを上書きします")
         return output
 
     def _set_running(self, running: bool) -> None:
@@ -746,25 +798,25 @@ class MainWindow(QMainWindow):
         self.input_edit.setEnabled(not running)
         if running:
             self.progress_bar.setValue(0)
-            self.status_label.setText("Analyzing…")
+            self.status_label.setText("解析中…")
         else:
-            self.status_label.setText("Ready" if self.result is None else "Analysis ready")
+            self.status_label.setText("準備完了" if self.result is None else "解析結果を表示中")
 
     def start_analysis(self) -> None:
         if self.worker and self.worker.isRunning():
             return
         input_text = self.input_edit.text().strip()
         if not input_text:
-            self._show_error("Input required", "Drop a WAV stem or choose one with Ctrl+O.")
+            self._show_error("入力が必要です", "WAVステムをドロップするか、Ctrl+Oで選択してください。")
             return
         input_path = Path(input_text)
         if not input_path.exists():
-            self._show_error("Input not found", str(input_path))
+            self._show_error("入力ファイルが見つかりません", str(input_path))
             return
         try:
             outputs = self._outputs()
         except ValueError as exc:
-            self._show_error("Invalid output", str(exc))
+            self._show_error("出力設定が正しくありません", str(exc))
             return
         self.result = None
         self.rows = []
@@ -772,7 +824,7 @@ class MainWindow(QMainWindow):
         self.hit_table.setRowCount(0)
         self.sample_list.clear()
         self._set_running(True)
-        self._log("Starting analysis…")
+        self._log("解析を開始します…")
         self.worker = AnalysisWorker(input_path, self._settings(), outputs, self)
         self.worker.progress.connect(self._on_progress)
         self.worker.result_ready.connect(self._on_result)
@@ -784,8 +836,8 @@ class MainWindow(QMainWindow):
     def cancel_analysis(self) -> None:
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
-            self.status_label.setText("Canceling…")
-            self._log("Cancellation requested…")
+            self.status_label.setText("キャンセル中…")
+            self._log("キャンセルを要求しました…")
 
     @Slot(int, str)
     def _on_progress(self, percent: int, message: str) -> None:
@@ -817,29 +869,35 @@ class MainWindow(QMainWindow):
             for cluster in result.plan.clusters:
                 self.sample_list.addItem(QListWidgetItem(f"sample_{cluster.id:03d}"))
         self._log(
-            f"Complete: {summary['detected_hits']} hits · {summary['required_samples']} samples · "
-            f"{summary['reuse_ratio']:.1f}% reuse"
+            f"解析完了: ヒット{summary['detected_hits']}件 · 必要サンプル{summary['required_samples']}個 · "
+            f"再利用率{summary['reuse_ratio']:.1f}%"
         )
-        self.status_label.setText("Analysis ready")
+        self.status_label.setText("解析結果を表示中")
 
     @Slot(str)
     def _on_failed(self, details: str) -> None:
-        first_line = next((line.strip() for line in details.splitlines() if line.strip()), "Unknown error")
-        self._log(f"ERROR  {first_line}")
-        self._log(details)
-        self._show_error("Analysis failed", first_line, details)
+        if "Could not read WAV" in details:
+            message = "WAVファイルを読み込めませんでした。PCM WAVか確認してください。"
+        elif "must not overwrite" in details or "上書き" in details:
+            message = "入力WAVを上書きする出力先は指定できません。"
+        elif "PermissionError" in details:
+            message = "ファイルへのアクセス権がありません。"
+        else:
+            message = "解析中にエラーが発生しました。入力と出力先を確認してください。"
+        self._log(f"解析エラー: {message}")
+        self._show_error("解析に失敗しました", message, f"技術詳細（開発者向け）:\n{details}")
 
     @Slot()
     def _on_canceled(self) -> None:
         self.progress_bar.setValue(0)
-        self.status_label.setText("Canceled")
-        self._log("Analysis canceled.")
+        self.status_label.setText("キャンセル済み")
+        self._log("解析をキャンセルしました。")
 
     def _refresh_table(self) -> None:
         if not hasattr(self, "hit_table"):
             return
         selected = self._selected_row_id()
-        wanted = self.filter_combo.currentText() if hasattr(self, "filter_combo") else "All"
+        wanted = self.filter_combo.currentData() if hasattr(self, "filter_combo") else "All"
         query = self.search_edit.text().strip().casefold() if hasattr(self, "search_edit") else ""
         self.hit_table.setSortingEnabled(False)
         self.hit_table.setRowCount(0)
@@ -858,7 +916,7 @@ class MainWindow(QMainWindow):
                 f"{row['confidence']:.1f}%",
                 f"{row['gain_db']:+.2f} dB",
                 row["sample_id"],
-                "Tail / overlap" if row["overlap"] else "",
+                "音の重なり" if row["overlap"] else "",
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -893,12 +951,12 @@ class MainWindow(QMainWindow):
             return
         self.waveform.set_selected(hit_id)
         label = CLASS_LABELS.get(row["classification"], row["classification"])
-        self.detail_title.setText(f"Hit {row['id']:03d}  ·  {label}")
+        self.detail_title.setText(f"ヒット {row['id']:03d}  ·  {label}")
         self.detail_title.setStyleSheet(f"color:{CLASS_COLORS.get(row['classification'], '#e5e7eb')};font-size:12pt;font-weight:700;")
         self.detail_metrics.setText(
-            f"{format_seconds(row['time'])}  ·  {row['sample_id']}  ·  {row['confidence']:.1f}% confidence  ·  {row['gain_db']:+.2f} dB\n"
-            f"Waveform {row['waveform'] * 100:.2f}%   Spectral {row['spectral'] * 100:.2f}%   "
-            f"Attack {row['attack'] * 100:.2f}%   Body {row['body'] * 100:.2f}%   Tail {row['tail'] * 100:.2f}%"
+            f"時刻 {format_seconds(row['time'])}  ·  {row['sample_id']}  ·  信頼度 {row['confidence']:.1f}%  ·  音量差 {row['gain_db']:+.2f} dB\n"
+            f"波形 {row['waveform'] * 100:.2f}%   スペクトル {row['spectral'] * 100:.2f}%   "
+            f"アタック {row['attack'] * 100:.2f}%   ボディ {row['body'] * 100:.2f}%   テール {row['tail'] * 100:.2f}%"
         )
 
     def _sample_path_for_selected(self) -> Path | None:
@@ -916,7 +974,7 @@ class MainWindow(QMainWindow):
     def _play_selected(self) -> None:
         path = self._sample_path_for_selected()
         if not path or not path.exists():
-            self._log("No exported representative WAV is available for this hit.")
+            self._log("このヒットの代表WAVはまだありません。")
             return
         try:
             if sys.platform == "win32":
@@ -927,9 +985,9 @@ class MainWindow(QMainWindow):
                 from PySide6.QtCore import QProcess
 
                 QProcess.startDetached("xdg-open", [str(path)])
-            self._log(f"Playing {path.name}")
+            self._log(f"再生中: {path.name}")
         except Exception as exc:
-            self._show_error("Playback failed", str(exc))
+            self._show_error("再生に失敗しました", str(exc))
 
     def _open_samples_folder(self) -> None:
         target = self.samples_edit.text().strip()
@@ -945,7 +1003,7 @@ class MainWindow(QMainWindow):
 
                 QProcess.startDetached("xdg-open", [str(path)])
         except Exception as exc:
-            self._show_error("Could not open folder", str(exc))
+            self._show_error("フォルダを開けませんでした", str(exc))
 
     def _show_error(self, title: str, message: str, details: str | None = None) -> None:
         box = QMessageBox(self)
@@ -983,13 +1041,22 @@ def create_app(argv: list[str] | None = None) -> QApplication:
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("StemReuse")
     app.setStyle("Fusion")
-    app.setFont(QFont("Segoe UI", 10))
+    font_family = "Yu Gothic UI"
+    for font_path in (r"C:\Windows\Fonts\YuGothM.ttc", r"C:\Windows\Fonts\meiryo.ttc", r"C:\Windows\Fonts\NotoSansJP-VF.ttf"):
+        if Path(font_path).exists():
+            font_id = QFontDatabase.addApplicationFont(font_path)
+            if font_id >= 0 and QFontDatabase.applicationFontFamilies(font_id):
+                font_family = QFontDatabase.applicationFontFamilies(font_id)[0]
+                break
+    font = QFont(font_family, 10)
+    font.setStyleHint(QFont.SansSerif)
+    app.setFont(font)
     return app
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = __import__("argparse").ArgumentParser(prog="bms-reuse-gui", description="StemReuse desktop GUI")
-    parser.add_argument("input", nargs="?", help="optional WAV to open at startup")
+    parser = __import__("argparse").ArgumentParser(prog="bms-reuse-gui", description="StemReuseデスクトップGUI")
+    parser.add_argument("input", nargs="?", help="起動時に開くWAV（任意）")
     args = parser.parse_args(argv)
     app = create_app()
     window = MainWindow(args.input)
