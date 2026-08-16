@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bms-stem-reuse-analyzer"
+version = "0.1.0"
+description = "Find reusable hits in BMS instrument stems"
+requires-python = ">=3.10"
+
+[project.scripts]
+bms-reuse = "bms_reuse.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
