@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Find reusable hits in BMS instrument stems"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+gui = ["PySide6-Essentials>=6.7,<6.8"]
+
 [project.scripts]
 bms-reuse = "bms_reuse.cli:main"
 

@@ -6,6 +6,7 @@ import hashlib
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .classification.classifier import classify_report
 from .clustering.reuse_plan import ReusePlan, build_reuse_plan
@@ -57,6 +58,10 @@ class AnalysisResult:
         return data
 
 
+class AnalysisCancelled(Exception):
+    """Raised when an optional GUI cancellation request is observed."""
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -79,7 +84,15 @@ def analyze_file(
     bpm: float | None = None,
     offset: float = 0.0,
     subdivision: int = 16,
+    progress: Callable[[int, str], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> AnalysisResult:
+    def report(percent: int, message: str) -> None:
+        if is_cancelled and is_cancelled():
+            raise AnalysisCancelled()
+        if progress:
+            progress(percent, message)
+
     path = Path(path)
     if not 0.0 <= threshold <= 1.0 or not 0.0 <= spectral_threshold <= 1.0:
         raise ValueError("threshold and spectral_threshold must be between 0 and 1")
@@ -89,8 +102,10 @@ def analyze_file(
         raise ValueError("bpm must be positive")
     if subdivision <= 0:
         raise ValueError("subdivision must be positive")
+    report(5, "Loading audio")
     audio = load_audio(path)
     mono = mono_signal(audio)
+    report(18, "Detecting onsets")
     onsets = detect_onsets(
         mono,
         audio.sample_rate,
@@ -100,18 +115,26 @@ def analyze_file(
         offset=offset,
         subdivision=subdivision,
     )
+    report(28, f"Extracting {len(onsets)} hits")
     hits = extract_hits(audio, onsets, pre_roll_ms=pre_roll_ms, window_ms=window_ms)
-    for hit in hits:
+    for index, hit in enumerate(hits):
+        if is_cancelled and is_cancelled():
+            raise AnalysisCancelled()
         hit.features = extract_features(hit.samples, audio.sample_rate)
+        if hits:
+            report(30 + round((index + 1) / len(hits) * 20), "Extracting features")
 
     def compare(reference, candidate):
         return compare_hits(reference, candidate, audio.sample_rate, max_alignment_ms=max_alignment_ms)
 
+    report(52, "Comparing and clustering hits")
     plan, comparisons = build_reuse_plan(
         hits,
         compare,
         threshold=threshold,
         spectral_threshold=spectral_threshold,
+        progress=lambda done, total: report(52 + round(done / max(1, total) * 43), "Comparing and clustering hits"),
+        is_cancelled=is_cancelled,
     )
     settings = {
         "instrument": instrument,
@@ -126,4 +149,5 @@ def analyze_file(
         "offset": offset,
         "subdivision": subdivision,
     }
+    report(100, "Analysis complete")
     return AnalysisResult(str(path), audio.sample_rate, audio.duration, hits, comparisons, plan, settings, _sha256(path))

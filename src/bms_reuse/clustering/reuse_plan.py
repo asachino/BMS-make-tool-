@@ -61,6 +61,8 @@ def build_reuse_plan(
     *,
     threshold: float = 0.995,
     spectral_threshold: float = 0.92,
+    progress: Callable[[int, int], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[ReusePlan, list[SimilarityReport]]:
     """Group hits against existing representatives; return plan and comparisons.
 
@@ -75,9 +77,18 @@ def build_reuse_plan(
     # ponytail: sequential representative scan; add indexed clustering if
     # large stems make O(hits × clusters) measurable.
     if callable(compare):
-        for hit in hits:
+        total = len(hits)
+        for index, hit in enumerate(hits):
+            if is_cancelled and is_cancelled():
+                from ..application import AnalysisCancelled
+
+                raise AnalysisCancelled()
             assigned = False
             for cluster in clusters:
+                if is_cancelled and is_cancelled():
+                    from ..application import AnalysisCancelled
+
+                    raise AnalysisCancelled()
                 report = classify_report(compare(by_id[cluster.representative_hit], hit), threshold=threshold, spectral_threshold=spectral_threshold)
                 reports.append(report)
                 if report.classification in {"SAME", "GAIN_VARIANT"}:
@@ -89,6 +100,8 @@ def build_reuse_plan(
                 cluster = Cluster(len(clusters) + 1, hit.id, [hit.id])
                 clusters.append(cluster)
                 assignments[hit.id] = (cluster.id, 0.0)
+            if progress:
+                progress(index + 1, total)
     else:
         reports = list(compare)
         indexed = {(report.reference_id, report.candidate_id): report for report in reports}
