@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from bms_reuse.classification.classifier import classify_report
-from bms_reuse.application import analyze_file
+from bms_reuse.application import AnalysisCancelled, analyze_file
 from bms_reuse.audio.loader import load_audio, mono_signal
 from bms_reuse.detection.onset import Onset, detect_onsets
 from bms_reuse.extraction.hit_extractor import Hit, extract_hits
@@ -102,6 +102,18 @@ class BoundaryTest(unittest.TestCase):
             report = compare_hits(hits[0], hits[1], 1000, max_alignment_ms=5)
             self.assertTrue(report.overlap_warning)
             self.assertEqual(classify_report(report).classification, "OVERLAP")
+
+    def test_hit_extraction_reports_progress_and_honors_cancel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "bms-progress.wav"
+            audio = load_audio(write_wav(source, [0.0] * 120, 1000))
+            onsets = [Onset(index, index * 20, index * 0.02) for index in range(3)]
+            updates = []
+            hits = extract_hits(audio, onsets, window_ms=20, progress=lambda done, total: updates.append((done, total)))
+            self.assertEqual(len(hits), 3)
+            self.assertEqual(updates[-1], (3, 3))
+            with self.assertRaises(AnalysisCancelled):
+                extract_hits(audio, onsets, window_ms=20, is_cancelled=lambda: True)
 
 
 if __name__ == "__main__":

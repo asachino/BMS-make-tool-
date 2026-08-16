@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
-from .application import analyze_file
+from .application import analyze_file, record_output_timing
 from .export.csv_exporter import write_hits_csv
 from .export.json_exporter import write_json
 from .export.wav_exporter import write_hit_wavs
@@ -65,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
             offset=args.offset,
             subdivision=args.subdivision,
         )
+        output_started = time.perf_counter()
         data = result.to_dict()
         if args.export_dir:
             for cluster in result.plan.clusters:
@@ -77,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
             write_hit_wavs(args.export_dir, audio, result.hits, result.plan)
         if args.csv:
             write_hits_csv(args.csv, result.hits, result.plan.events)
+        record_output_timing(result, time.perf_counter() - output_started)
+        data = result.to_dict()
+        write_json(output, data)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

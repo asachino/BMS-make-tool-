@@ -9,11 +9,12 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSettings, QSize, QThread, Qt, Signal, Slot
+    from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSettings, QSize, QThread, QTimer, Qt, Signal, Slot
     from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase, QKeySequence, QPainter, QPen, QShortcut
     from PySide6.QtWidgets import (
         QApplication,
@@ -48,7 +49,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised by the CLI-only install
     raise RuntimeError("GUI requires PySide6. Install with: pip install .[gui]") from exc
 
-from .application import AnalysisCancelled, AnalysisResult, analyze_file
+from .application import AnalysisCancelled, AnalysisResult, analyze_file, record_output_timing
 from .audio.loader import load_audio
 from .export.csv_exporter import write_hits_csv
 from .export.json_exporter import write_json
@@ -101,12 +102,19 @@ def localize_progress(message: str) -> str:
         return "音声を読み込み中"
     if message == "Detecting onsets":
         return "オンセットを検出中"
+    if message.startswith("Extracting hits "):
+        return f"ヒットを切り出し中 {message[16:]}"
     if message.startswith("Extracting ") and message.endswith(" hits"):
         return f"{message[11:-5]}個のヒットを切り出し中"
     if message == "Extracting features":
         return "特徴量を抽出中"
+    if message.startswith("Extracting features "):
+        return f"特徴量を抽出中 {message[20:]}"
     if message == "Comparing and clustering hits":
         return "比較・クラスタリング中"
+    if message.startswith("Comparing and clustering hits "):
+        detail = message[30:].replace(" comparisons", "件比較")
+        return f"比較・クラスタリング中 {detail}"
     if message == "Writing analysis JSON":
         return "解析JSONを書き出し中"
     if message == "Writing representative samples":
@@ -258,12 +266,25 @@ class AnalysisWorker(QThread):
         self.settings = settings
         self.outputs = outputs
         self.cancel_event = threading.Event()
+        self._last_progress_at = 0.0
+        self._last_progress_stage = ""
 
     def cancel(self) -> None:
         self.cancel_event.set()
 
     def _on_progress(self, percent: int, message: str) -> None:
-        self.progress.emit(max(0, min(100, percent)), localize_progress(message))
+        localized = localize_progress(message)
+        stage = localized.split(" ", 1)[0]
+        now = time.monotonic()
+        if (
+            self._last_progress_stage == stage
+            and now - self._last_progress_at < 0.15
+            and percent < 100
+        ):
+            return
+        self._last_progress_at = now
+        self._last_progress_stage = stage
+        self.progress.emit(max(0, min(100, percent)), localized)
 
     def run(self) -> None:  # noqa: D401 - Qt thread entry point
         try:
@@ -276,6 +297,7 @@ class AnalysisWorker(QThread):
             if self.cancel_event.is_set():
                 raise AnalysisCancelled()
             exported: dict[str, object] = {}
+            output_started = time.perf_counter()
             self._on_progress(94, "Writing analysis JSON")
             json_path = self.outputs.get("json")
             if json_path:
@@ -301,6 +323,9 @@ class AnalysisWorker(QThread):
             if csv_path:
                 self._on_progress(98, "Writing event CSV")
                 exported["csv"] = str(write_hits_csv(csv_path, result.hits, result.plan.events))
+            record_output_timing(result, time.perf_counter() - output_started)
+            if json_path:
+                exported["json"] = str(write_json(json_path, result.to_dict()))
             self._on_progress(100, "Analysis complete")
             self.result_ready.emit(result, exported)
         except AnalysisCancelled:
@@ -466,6 +491,11 @@ class MainWindow(QMainWindow):
         self.rows: list[dict] = []
         self.exported: dict[str, object] = {}
         self._last_progress_message = ""
+        self._processing_stage = "待機中"
+        self._analysis_started_at: float | None = None
+        self.processing_timer = QTimer(self)
+        self.processing_timer.setInterval(150)
+        self.processing_timer.timeout.connect(self._refresh_processing_status)
 
         self._build_ui()
         self._apply_theme(self.settings_store.value("theme", "Dark"))
@@ -638,6 +668,10 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         left_layout.addWidget(self.progress_bar)
+        self.processing_status_label = QLabel("待機中")
+        self.processing_status_label.setObjectName("Status")
+        self.processing_status_label.setWordWrap(True)
+        left_layout.addWidget(self.processing_status_label)
 
         log_group = QGroupBox("処理ログ")
         log_layout = QVBoxLayout(log_group)
@@ -917,6 +951,14 @@ class MainWindow(QMainWindow):
                 raise ValueError("サンプル出力が入力WAVを上書きします")
         return output
 
+    def _refresh_processing_status(self) -> None:
+        if not hasattr(self, "processing_status_label") or self._analysis_started_at is None:
+            return
+        elapsed = max(0.0, time.monotonic() - self._analysis_started_at)
+        self.processing_status_label.setText(
+            f"処理中…  経過 {elapsed:.1f}秒  ·  キャンセル可能\n{self._processing_stage}"
+        )
+
     def _set_running(self, running: bool) -> None:
         self.cancel_button.setEnabled(running)
         self.drop_zone.setEnabled(not running)
@@ -924,8 +966,15 @@ class MainWindow(QMainWindow):
         if running:
             self.progress_bar.setValue(0)
             self.status_label.setText("解析中…")
+            self._processing_stage = "準備中…"
+            self._analysis_started_at = time.monotonic()
+            self.processing_timer.start()
+            self._refresh_processing_status()
         else:
+            self.processing_timer.stop()
+            self._analysis_started_at = None
             self.status_label.setText("準備完了" if self.result is None else "解析結果を表示中")
+            self.processing_status_label.setText("待機中" if self.result is None else "解析結果を表示中")
             self._update_start_enabled()
 
     def start_analysis(self) -> None:
@@ -973,12 +1022,17 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.status_label.setText("キャンセル中…")
+            self._processing_stage = "キャンセル処理中…"
+            self.cancel_button.setEnabled(False)
+            self._refresh_processing_status()
             self._log("キャンセルを要求しました…")
 
     @Slot(int, str)
     def _on_progress(self, percent: int, message: str) -> None:
         self.progress_bar.setValue(percent)
         self.status_label.setText(message)
+        self._processing_stage = message
+        self._refresh_processing_status()
         if message != self._last_progress_message:
             self._log(f"{percent:3d}%  {message}")
             self._last_progress_message = message
@@ -1008,6 +1062,19 @@ class MainWindow(QMainWindow):
             f"解析完了: ヒット{summary['detected_hits']}件 · 必要サンプル{summary['required_samples']}個 · "
             f"再利用率{summary['reuse_ratio']:.1f}%"
         )
+        timings = summary.get("timings", {})
+        if timings:
+            self._log(
+                "処理時間: 読込{load:.2f}秒 · オンセット{onset:.2f}秒 · ヒット切り出し{hit:.2f}秒 · "
+                "比較{compare:.2f}秒 · 合計{total:.2f}秒".format(
+                    load=timings.get("load_seconds", 0.0),
+                    onset=timings.get("onset_seconds", 0.0),
+                    hit=timings.get("hit_seconds", 0.0),
+                    compare=timings.get("compare_seconds", 0.0),
+                    total=timings.get("total_seconds", 0.0),
+                )
+            )
+        self._processing_stage = "解析完了"
         self.status_label.setText("解析結果を表示中")
 
     @Slot(str)
@@ -1020,6 +1087,7 @@ class MainWindow(QMainWindow):
             message = "ファイルへのアクセス権がありません。"
         else:
             message = "解析中にエラーが発生しました。入力と出力先を確認してください。"
+        self._processing_stage = "解析エラー"
         self._log(f"解析エラー: {message}")
         self._show_error("解析に失敗しました", message, f"技術詳細（開発者向け）:\n{details}")
 
@@ -1027,6 +1095,7 @@ class MainWindow(QMainWindow):
     def _on_canceled(self) -> None:
         self.progress_bar.setValue(0)
         self.status_label.setText("キャンセル済み")
+        self._processing_stage = "キャンセル済み"
         self._log("解析をキャンセルしました。")
 
     def _refresh_table(self) -> None:

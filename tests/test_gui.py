@@ -61,6 +61,11 @@ class GuiSupportTest(unittest.TestCase):
         self.assertEqual(CLASS_LABELS["OVERLAP"], "音の重なり")
         self.assertEqual(localize_progress("Analysis complete"), "解析完了")
         self.assertEqual(localize_progress("Extracting 12 hits"), "12個のヒットを切り出し中")
+        self.assertEqual(localize_progress("Extracting hits 3/12"), "ヒットを切り出し中 3/12")
+        self.assertEqual(
+            localize_progress("Comparing and clustering hits 3/12 (8 comparisons)"),
+            "比較・クラスタリング中 3/12 (8件比較)",
+        )
         visible_text = " ".join(
             [
                 window.windowTitle(),
@@ -78,6 +83,12 @@ class GuiSupportTest(unittest.TestCase):
         for forbidden in ("Open WAV", "Analyze", "Cancel", "Ready", "Analysis", "Required", "Detected", "Review"):
             self.assertNotIn(forbidden, visible_text)
         self.assertFalse(window.cancel_button.isEnabled())
+        window._set_running(True)
+        self.assertIn("処理中…", window.processing_status_label.text())
+        self.assertIn("キャンセル可能", window.processing_status_label.text())
+        window._on_progress(57, "比較・クラスタリング中 3/12 (8件比較)")
+        self.assertIn("3/12", window.processing_status_label.text())
+        window._set_running(False)
         window.close()
 
     def test_bpm_is_required_and_interval_formula_drives_settings(self):
@@ -126,6 +137,9 @@ class GuiSupportTest(unittest.TestCase):
                 fade_out_ms=3.0,
             )
             settings = result.to_dict()["settings"]
+            self.assertIn("timings", settings)
+            self.assertIn("compare_seconds", settings["timings"])
+            self.assertIn("total_seconds", result.summary["timings"])
             self.assertEqual(settings["bpm"], 120.0)
             self.assertEqual(settings["beat_division"], 8)
             self.assertEqual(settings["margin"], 80.0)

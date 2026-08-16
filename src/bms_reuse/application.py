@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,7 @@ class AnalysisResult:
             "overlap": counts.get("OVERLAP", 0),
             "required_samples": self.plan.required_samples,
             "reuse_ratio": round((1.0 - self.plan.required_samples / len(self.hits)) * 100.0, 2) if self.hits else 0.0,
+            "timings": dict(self.settings.get("timings", {})),
         }
 
     def to_dict(self) -> dict:
@@ -60,6 +62,14 @@ class AnalysisResult:
 
 class AnalysisCancelled(Exception):
     """Raised when an optional GUI cancellation request is observed."""
+
+
+def record_output_timing(result: AnalysisResult, output_seconds: float) -> None:
+    """Attach export timing after the caller finishes writing artifacts."""
+    timings = result.settings.setdefault("timings", {})
+    output_seconds = max(0.0, float(output_seconds))
+    timings["output_seconds"] = round(output_seconds, 6)
+    timings["total_seconds"] = round(float(timings.get("analysis_seconds", 0.0)) + output_seconds, 6)
 
 
 def _sha256(path: Path) -> str:
@@ -93,6 +103,8 @@ def analyze_file(
     fade_in_ms: float = 0.0,
     fade_out_ms: float = 0.0,
 ) -> AnalysisResult:
+    analysis_started = time.perf_counter()
+
     def report(percent: int, message: str) -> None:
         if is_cancelled and is_cancelled():
             raise AnalysisCancelled()
@@ -122,9 +134,22 @@ def analyze_file(
         raise ValueError("bpm must be positive")
     if subdivision <= 0:
         raise ValueError("subdivision must be positive")
+    timings = {
+        "load_seconds": 0.0,
+        "onset_seconds": 0.0,
+        "hit_seconds": 0.0,
+        "feature_seconds": 0.0,
+        "compare_seconds": 0.0,
+        "output_seconds": 0.0,
+        "analysis_seconds": 0.0,
+        "total_seconds": 0.0,
+    }
+    stage_started = time.perf_counter()
     report(5, "Loading audio")
     audio = load_audio(path)
     mono = mono_signal(audio)
+    timings["load_seconds"] = round(time.perf_counter() - stage_started, 6)
+    stage_started = time.perf_counter()
     report(18, "Detecting onsets")
     onsets = detect_onsets(
         mono,
@@ -135,27 +160,61 @@ def analyze_file(
         offset=offset,
         subdivision=subdivision,
     )
+    timings["onset_seconds"] = round(time.perf_counter() - stage_started, 6)
+    stage_started = time.perf_counter()
     report(28, f"Extracting {len(onsets)} hits")
-    hits = extract_hits(audio, onsets, pre_roll_ms=pre_roll_ms, window_ms=window_ms)
+    report(28, f"Extracting hits 0/{len(onsets)}")
+    hits = extract_hits(
+        audio,
+        onsets,
+        pre_roll_ms=pre_roll_ms,
+        window_ms=window_ms,
+        progress=lambda done, total: report(28 + round(done / max(1, total) * 2), f"Extracting hits {done}/{total}"),
+        is_cancelled=is_cancelled,
+    )
+    timings["hit_seconds"] = round(time.perf_counter() - stage_started, 6)
+    stage_started = time.perf_counter()
+    if hits:
+        report(30, f"Extracting features 0/{len(hits)}")
     for index, hit in enumerate(hits):
         if is_cancelled and is_cancelled():
             raise AnalysisCancelled()
         hit.features = extract_features(hit.samples, audio.sample_rate)
         if hits:
-            report(30 + round((index + 1) / len(hits) * 20), "Extracting features")
+            report(30 + round((index + 1) / len(hits) * 20), f"Extracting features {index + 1}/{len(hits)}")
+    timings["feature_seconds"] = round(time.perf_counter() - stage_started, 6)
 
     def compare(reference, candidate):
         return compare_hits(reference, candidate, audio.sample_rate, max_alignment_ms=max_alignment_ms)
 
     report(52, "Comparing and clustering hits")
+    stage_started = time.perf_counter()
+    last_compare_report = [0.0]
+
+    def report_compare_detail(current: int, total: int, compared: int) -> None:
+        now = time.perf_counter()
+        if compared == 1 or current == total or now - last_compare_report[0] >= 0.15:
+            last_compare_report[0] = now
+            report(
+                52 + round(current / max(1, total) * 43),
+                f"Comparing and clustering hits {current}/{total} ({compared} comparisons)",
+            )
+
     plan, comparisons = build_reuse_plan(
         hits,
         compare,
         threshold=threshold,
         spectral_threshold=spectral_threshold,
-        progress=lambda done, total: report(52 + round(done / max(1, total) * 43), "Comparing and clustering hits"),
+        progress=lambda done, total: report(52 + round(done / max(1, total) * 43), f"Comparing and clustering hits {done}/{total}"),
+        progress_detail=report_compare_detail,
         is_cancelled=is_cancelled,
     )
+    timings["compare_seconds"] = round(time.perf_counter() - stage_started, 6)
+    timings["analysis_seconds"] = round(time.perf_counter() - analysis_started, 6)
+    timings["total_seconds"] = timings["analysis_seconds"]
+    if not audio.frame_count:
+        for key in timings:
+            timings[key] = 0.0
     settings = {
         "instrument": instrument,
         "threshold": threshold,
@@ -174,6 +233,7 @@ def analyze_file(
         "subdivision": subdivision,
         "fade_in_ms": fade_in_ms,
         "fade_out_ms": fade_out_ms,
+        "timings": timings,
     }
     report(100, "Analysis complete")
     return AnalysisResult(str(path), audio.sample_rate, audio.duration, hits, comparisons, plan, settings, _sha256(path))

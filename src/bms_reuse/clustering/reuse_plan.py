@@ -62,6 +62,7 @@ def build_reuse_plan(
     threshold: float = 0.995,
     spectral_threshold: float = 0.92,
     progress: Callable[[int, int], None] | None = None,
+    progress_detail: Callable[[int, int, int], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[ReusePlan, list[SimilarityReport]]:
     """Group hits against existing representatives; return plan and comparisons.
@@ -74,6 +75,7 @@ def build_reuse_plan(
     clusters: list[Cluster] = []
     assignments: dict[int, tuple[int, float]] = {}
     reports: list[SimilarityReport] = []
+    comparison_cache: dict[tuple[int, int], SimilarityReport] = {}
     # ponytail: sequential representative scan; add indexed clustering if
     # large stems make O(hits × clusters) measurable.
     if callable(compare):
@@ -84,13 +86,22 @@ def build_reuse_plan(
 
                 raise AnalysisCancelled()
             assigned = False
+            compared = 0
             for cluster in clusters:
                 if is_cancelled and is_cancelled():
                     from ..application import AnalysisCancelled
 
                     raise AnalysisCancelled()
-                report = classify_report(compare(by_id[cluster.representative_hit], hit), threshold=threshold, spectral_threshold=spectral_threshold)
+                key = (cluster.representative_hit, hit.id)
+                report = comparison_cache.get(key)
+                if report is None:
+                    report = compare(by_id[cluster.representative_hit], hit)
+                    comparison_cache[key] = report
+                report = classify_report(report, threshold=threshold, spectral_threshold=spectral_threshold)
                 reports.append(report)
+                compared += 1
+                if progress_detail:
+                    progress_detail(index + 1, total, compared)
                 if report.classification in {"SAME", "GAIN_VARIANT"}:
                     cluster.hit_ids.append(hit.id)
                     assignments[hit.id] = (cluster.id, report.gain_db if report.classification == "GAIN_VARIANT" else 0.0)
