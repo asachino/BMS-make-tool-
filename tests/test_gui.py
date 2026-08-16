@@ -5,7 +5,11 @@ import unittest
 from pathlib import Path
 
 from bms_reuse.application import analyze_file
+from bms_reuse.audio.loader import load_audio
+from bms_reuse.clustering.reuse_plan import Cluster, ReusePlan
+from bms_reuse.extraction.hit_extractor import Hit
 from bms_reuse.export.wav_exporter import write_wav
+from bms_reuse.export.wav_exporter import write_hit_wavs
 
 
 @unittest.skipUnless(importlib.util.find_spec("PySide6"), "PySide6 is optional")
@@ -45,6 +49,10 @@ class GuiSupportTest(unittest.TestCase):
         self.assertEqual(window.theme_combo.currentText(), "ダーク")
         self.assertEqual(window.theme_combo.currentData(), "Dark")
         self.assertEqual(window.instrument_combo.currentData(), "kick")
+        self.assertEqual([window.beat_division_combo.itemText(i) for i in range(window.beat_division_combo.count())], ["1/4", "1/8", "1/16", "1/32"])
+        self.assertEqual(window.margin_spin.value(), 90.0)
+        self.assertEqual(window.fade_in_spin.value(), 2.0)
+        self.assertEqual(window.fade_out_spin.value(), 2.0)
         self.assertEqual(window.filter_combo.itemData(2), "SAME")
         self.assertEqual(CLASS_LABELS["SAME"], "同一")
         self.assertEqual(CLASS_LABELS["GAIN_VARIANT"], "音量違い")
@@ -71,6 +79,70 @@ class GuiSupportTest(unittest.TestCase):
             self.assertNotIn(forbidden, visible_text)
         self.assertFalse(window.cancel_button.isEnabled())
         window.close()
+
+    def test_bpm_is_required_and_interval_formula_drives_settings(self):
+        from bms_reuse.gui import MainWindow
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "日本語ステム.wav"
+            write_wav(path, [0.0] * 100, 1000)
+            window = MainWindow()
+            window.set_input_path(str(path))
+            self.assertFalse(window.analyze_button.isEnabled())
+            self.assertIn("BPM", window.bpm_error_label.text())
+
+            window.bpm_spin.setValue(174.0)
+            self.assertTrue(window.analyze_button.isEnabled())
+            settings = window._settings()
+            expected = (60.0 / 174.0) / 16.0 * 0.90
+            self.assertAlmostEqual(settings["min_interval_sec"], expected)
+            self.assertAlmostEqual(settings["min_separation_ms"], expected * 1000.0)
+            self.assertEqual(settings["bpm"], 174.0)
+            self.assertEqual(settings["beat_division"], 16)
+            self.assertEqual(settings["margin"], 90.0)
+            self.assertEqual(settings["fade_in_ms"], 2.0)
+            self.assertEqual(settings["fade_out_ms"], 2.0)
+
+            window.beat_division_combo.setCurrentIndex(0)
+            window.margin_spin.setValue(80.0)
+            expected = (60.0 / 174.0) / 4.0 * 0.80
+            self.assertAlmostEqual(window._settings()["min_interval_sec"], expected)
+            window.bpm_spin.setValue(19.0)
+            self.assertFalse(window.analyze_button.isEnabled())
+            self.assertIn("20", window.bpm_error_label.text())
+            window.close()
+
+    def test_analysis_settings_and_export_fades_are_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "設定.wav"
+            write_wav(source, [], 1000)
+            result = analyze_file(
+                source,
+                bpm=120.0,
+                beat_division=8,
+                margin=80.0,
+                min_interval_sec=(60.0 / 120.0) / 8.0 * 0.80,
+                fade_in_ms=2.0,
+                fade_out_ms=3.0,
+            )
+            settings = result.to_dict()["settings"]
+            self.assertEqual(settings["bpm"], 120.0)
+            self.assertEqual(settings["beat_division"], 8)
+            self.assertEqual(settings["margin"], 80.0)
+            self.assertAlmostEqual(settings["min_interval_sec"], 0.05)
+            self.assertEqual(settings["fade_in_ms"], 2.0)
+            self.assertEqual(settings["fade_out_ms"], 3.0)
+
+            audio = load_audio(write_wav(Path(directory) / "tone.wav", [[1.0]] * 10, 1000))
+            hit = Hit(1, 0, 0.0, audio.samples, 0, 10)
+            plan = ReusePlan([Cluster(1, 1, [1])], [])
+            paths = write_hit_wavs(Path(directory) / "samples", audio, [hit], plan, fade_in_ms=2.0, fade_out_ms=2.0)
+            exported = load_audio(paths[0])
+            values = exported.samples[:, 0].tolist() if hasattr(exported.samples, "tolist") else [row[0] for row in exported.samples]
+            self.assertAlmostEqual(values[0], 0.0, places=4)
+            self.assertAlmostEqual(values[1], 1.0, places=2)
+            self.assertAlmostEqual(values[-2], 1.0, places=2)
+            self.assertAlmostEqual(values[-1], 0.0, places=4)
 
 
 if __name__ == "__main__":

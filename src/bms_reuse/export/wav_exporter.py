@@ -61,7 +61,52 @@ def write_wav(path: str | Path, samples, sample_rate: int, channels: int = 1, *,
     return path
 
 
-def write_hit_wavs(output_dir: str | Path, audio: AudioData, hits, plan) -> list[Path]:
+def _apply_edge_fades(values, sample_rate: int, fade_in_ms: float = 0.0, fade_out_ms: float = 0.0):
+    """Return a copy with short linear fades at the exported boundaries."""
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    if (
+        not math.isfinite(float(fade_in_ms))
+        or not math.isfinite(float(fade_out_ms))
+        or fade_in_ms < 0
+        or fade_out_ms < 0
+    ):
+        raise ValueError("fade durations must be finite and non-negative")
+    if hasattr(values, "copy"):
+        faded = values.copy()
+    else:
+        faded = [list(frame) if isinstance(frame, (list, tuple)) else float(frame) for frame in values]
+    frame_count = len(faded)
+
+    def scale_frame(index: int, factor: float) -> None:
+        frame = faded[index]
+        if isinstance(frame, list):
+            faded[index] = [float(sample) * factor for sample in frame]
+        elif isinstance(frame, tuple):
+            faded[index] = tuple(float(sample) * factor for sample in frame)
+        else:
+            faded[index] = frame * factor
+
+    fade_in_frames = min(frame_count, round(sample_rate * float(fade_in_ms) / 1000.0))
+    for index in range(fade_in_frames):
+        factor = index / (fade_in_frames - 1) if fade_in_frames > 1 else 0.0
+        scale_frame(index, factor)
+    fade_out_frames = min(frame_count, round(sample_rate * float(fade_out_ms) / 1000.0))
+    for offset in range(fade_out_frames):
+        factor = (fade_out_frames - offset - 1) / (fade_out_frames - 1) if fade_out_frames > 1 else 0.0
+        scale_frame(frame_count - fade_out_frames + offset, factor)
+    return faded
+
+
+def write_hit_wavs(
+    output_dir: str | Path,
+    audio: AudioData,
+    hits,
+    plan,
+    *,
+    fade_in_ms: float = 0.0,
+    fade_out_ms: float = 0.0,
+) -> list[Path]:
     """Write one representative source window per reuse-plan cluster."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -85,6 +130,7 @@ def write_hit_wavs(output_dir: str | Path, audio: AudioData, hits, plan) -> list
             values = source[:, 0] if hasattr(source, "shape") and len(source.shape) > 1 else [row[0] for row in source]
         else:
             values = source
+        values = _apply_edge_fades(values, audio.sample_rate, fade_in_ms, fade_out_ms)
         path = output_dir / f"sample_{cluster.id:03d}.wav"
         write_wav(path, values, audio.sample_rate, audio.channels, sample_width=audio.sample_width)
         paths.append(path)

@@ -242,7 +242,17 @@ class AnalysisWorker(QThread):
             if export_dir:
                 self._on_progress(96, "Writing representative samples")
                 audio = load_audio(self.input_path)
-                exported["samples"] = [str(path) for path in write_hit_wavs(export_dir, audio, result.hits, result.plan)]
+                exported["samples"] = [
+                    str(path)
+                    for path in write_hit_wavs(
+                        export_dir,
+                        audio,
+                        result.hits,
+                        result.plan,
+                        fade_in_ms=float(self.settings.get("fade_in_ms", 0.0)),
+                        fade_out_ms=float(self.settings.get("fade_out_ms", 0.0)),
+                    )
+                ]
             csv_path = self.outputs.get("csv")
             if csv_path:
                 self._on_progress(98, "Writing event CSV")
@@ -421,6 +431,7 @@ class MainWindow(QMainWindow):
         if initial_path:
             self.set_input_path(initial_path)
         self._set_running(False)
+        self._on_bpm_changed()
         self._log("準備完了。WAVステムをドロップするか、Ctrl+Oで選択してください。")
 
     def _build_ui(self) -> None:
@@ -492,10 +503,29 @@ class MainWindow(QMainWindow):
         self.threshold_spin = self._double_spin(0.995, 0.0, 1.0, 0.001, 3)
         self.spectral_spin = self._double_spin(0.92, 0.0, 1.0, 0.001, 3)
         self.onset_spin = self._double_spin(0.35, 0.0, 1.0, 0.01, 2)
-        self.separation_spin = self._double_spin(50.0, 1.0, 5000.0, 1.0, 0, " ms")
         self.pre_roll_spin = self._double_spin(5.0, 0.0, 1000.0, 1.0, 0, " ms")
         self.window_spin = self._double_spin(800.0, 10.0, 10000.0, 10.0, 0, " ms")
-        self.bpm_spin = self._double_spin(0.0, 0.0, 999.0, 0.5, 1, " BPM")
+        self.bpm_spin = self._double_spin(0.0, 0.0, 400.0, 0.5, 1, " BPM")
+        self.bpm_spin.setSpecialValueText("未入力")
+        self.bpm_spin.setToolTip("20〜400の範囲で入力（必須）")
+        self.beat_division_combo = QComboBox()
+        for denominator in (4, 8, 16, 32):
+            self.beat_division_combo.addItem(f"1/{denominator}", denominator)
+        self.beat_division_combo.setCurrentIndex(2)
+        self.beat_division_combo.setToolTip("BPMから最小間隔を計算する拍の分割")
+        self.margin_spin = self._double_spin(90.0, 80.0, 100.0, 1.0, 0, " %")
+        self.margin_spin.setToolTip("BPMから計算した間隔に適用する余裕")
+        self.bpm_error_label = QLabel()
+        self.bpm_error_label.setObjectName("BpmError")
+        self.bpm_error_label.setWordWrap(True)
+        self.bpm_error_label.setStyleSheet("color:#fb7185;font-size:9pt;")
+        self.bpm_spin.valueChanged.connect(self._on_bpm_changed)
+        self.margin_spin.valueChanged.connect(self._on_bpm_changed)
+        self.beat_division_combo.currentIndexChanged.connect(self._on_bpm_changed)
+        self.fade_in_spin = self._double_spin(2.0, 0.0, 1000.0, 0.5, 1, " ms")
+        self.fade_out_spin = self._double_spin(2.0, 0.0, 1000.0, 0.5, 1, " ms")
+        self.fade_in_spin.setToolTip("書き出す代表WAVの先頭フェード（0で無効）")
+        self.fade_out_spin.setToolTip("書き出す代表WAVの末尾フェード（0で無効）")
         self.offset_spin = self._double_spin(0.0, -60.0, 60.0, 0.001, 3, " s")
         self.alignment_spin = self._double_spin(5.0, 0.0, 100.0, 0.5, 1, " ms")
         self.subdivision_spin = QSpinBox()
@@ -505,10 +535,14 @@ class MainWindow(QMainWindow):
         settings_form.addRow("同一判定しきい値", self.threshold_spin)
         settings_form.addRow("スペクトルしきい値", self.spectral_spin)
         settings_form.addRow("オンセットしきい値", self.onset_spin)
-        settings_form.addRow("最小間隔", self.separation_spin)
         settings_form.addRow("プリロール", self.pre_roll_spin)
         settings_form.addRow("ウィンドウ長", self.window_spin)
-        settings_form.addRow("BPM（任意）", self.bpm_spin)
+        settings_form.addRow("BPM（必須）", self.bpm_spin)
+        settings_form.addRow("最小間隔（拍）", self.beat_division_combo)
+        settings_form.addRow("マージン(%)", self.margin_spin)
+        settings_form.addRow("", self.bpm_error_label)
+        settings_form.addRow("フェードイン(ms)", self.fade_in_spin)
+        settings_form.addRow("フェードアウト(ms)", self.fade_out_spin)
         settings_form.addRow("グリッドオフセット", self.offset_spin)
         settings_form.addRow("分割数", self.subdivision_spin)
         settings_form.addRow("最大アライメント", self.alignment_spin)
@@ -724,6 +758,7 @@ class MainWindow(QMainWindow):
         self.samples_edit.setText(str(path.parent / f"{path.stem}_keysounds"))
         self.csv_edit.setText(str(path.with_suffix(".csv")))
         self._log(f"入力を選択しました: {path}")
+        self._update_start_enabled()
 
     def _browse_input(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "WAVステムを選択", str(Path(self.input_edit.text()).parent if self.input_edit.text() else Path.home()), "PCM WAV (*.wav)")
@@ -752,18 +787,54 @@ class MainWindow(QMainWindow):
     def _same_path(left: str | Path, right: str | Path) -> bool:
         return str(Path(left).resolve()).casefold() == str(Path(right).resolve()).casefold()
 
+    def _bpm_error_text(self) -> str:
+        bpm = self.bpm_spin.value()
+        if bpm <= 0:
+            return "BPMを入力してください（20〜400）。"
+        if not 20.0 <= bpm <= 400.0:
+            return "BPMは20〜400の範囲で入力してください。"
+        return ""
+
+    def _bpm_is_valid(self) -> bool:
+        return not self._bpm_error_text()
+
+    def _on_bpm_changed(self, _value=None) -> None:
+        message = self._bpm_error_text()
+        self.bpm_error_label.setText(message)
+        self._update_start_enabled()
+
+    def _update_start_enabled(self) -> None:
+        if not hasattr(self, "analyze_button"):
+            return
+        running = bool(self.worker and self.worker.isRunning())
+        input_text = self.input_edit.text().strip()
+        input_path = Path(input_text) if input_text else None
+        input_valid = bool(input_path and input_path.is_file())
+        self.analyze_button.setEnabled(not running and input_valid and self._bpm_is_valid())
+
     def _settings(self) -> dict:
-        bpm = self.bpm_spin.value() or None
+        if not self._bpm_is_valid():
+            raise ValueError(self._bpm_error_text())
+        bpm = self.bpm_spin.value()
+        denominator = int(self.beat_division_combo.currentData())
+        margin = self.margin_spin.value()
+        min_interval_sec = (60.0 / bpm) / denominator * (margin / 100.0)
         return {
             "instrument": self.instrument_combo.currentData() or "kick",
             "threshold": self.threshold_spin.value(),
             "spectral_threshold": self.spectral_spin.value(),
             "onset_threshold": self.onset_spin.value(),
-            "min_separation_ms": self.separation_spin.value(),
+            "min_separation_ms": min_interval_sec * 1000.0,
+            "min_interval_sec": min_interval_sec,
+            "beat_division": denominator,
+            "margin_percent": margin,
+            "margin": margin,
             "pre_roll_ms": self.pre_roll_spin.value(),
             "window_ms": self.window_spin.value(),
             "max_alignment_ms": self.alignment_spin.value(),
             "bpm": bpm,
+            "fade_in_ms": self.fade_in_spin.value(),
+            "fade_out_ms": self.fade_out_spin.value(),
             "offset": self.offset_spin.value(),
             "subdivision": self.subdivision_spin.value(),
         }
@@ -787,7 +858,6 @@ class MainWindow(QMainWindow):
         return output
 
     def _set_running(self, running: bool) -> None:
-        self.analyze_button.setEnabled(not running)
         self.cancel_button.setEnabled(running)
         self.drop_zone.setEnabled(not running)
         self.input_edit.setEnabled(not running)
@@ -796,6 +866,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("解析中…")
         else:
             self.status_label.setText("準備完了" if self.result is None else "解析結果を表示中")
+            self._update_start_enabled()
 
     def start_analysis(self) -> None:
         if self.worker and self.worker.isRunning():
@@ -803,6 +874,10 @@ class MainWindow(QMainWindow):
         input_text = self.input_edit.text().strip()
         if not input_text:
             self._show_error("入力が必要です", "WAVステムをドロップするか、Ctrl+Oで選択してください。")
+            return
+        if not self._bpm_is_valid():
+            self._on_bpm_changed()
+            self._show_error("BPMが必要です", self._bpm_error_text())
             return
         input_path = Path(input_text)
         if not input_path.exists():
@@ -820,7 +895,13 @@ class MainWindow(QMainWindow):
         self.sample_list.clear()
         self._set_running(True)
         self._log("解析を開始します…")
-        self.worker = AnalysisWorker(input_path, self._settings(), outputs, self)
+        try:
+            settings = self._settings()
+        except ValueError as exc:
+            self._show_error("解析設定が正しくありません", str(exc))
+            self._set_running(False)
+            return
+        self.worker = AnalysisWorker(input_path, settings, outputs, self)
         self.worker.progress.connect(self._on_progress)
         self.worker.result_ready.connect(self._on_result)
         self.worker.failed.connect(self._on_failed)

@@ -86,6 +86,12 @@ def analyze_file(
     subdivision: int = 16,
     progress: Callable[[int, str], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    min_interval_sec: float | None = None,
+    beat_division: int | None = None,
+    margin_percent: float | None = None,
+    margin: float | None = None,
+    fade_in_ms: float = 0.0,
+    fade_out_ms: float = 0.0,
 ) -> AnalysisResult:
     def report(percent: int, message: str) -> None:
         if is_cancelled and is_cancelled():
@@ -96,6 +102,20 @@ def analyze_file(
     path = Path(path)
     if not 0.0 <= threshold <= 1.0 or not 0.0 <= spectral_threshold <= 1.0:
         raise ValueError("threshold and spectral_threshold must be between 0 and 1")
+    if min_interval_sec is not None:
+        if min_interval_sec <= 0:
+            raise ValueError("min_interval_sec must be positive")
+        min_separation_ms = min_interval_sec * 1000.0
+    if margin is not None:
+        if margin_percent is not None and margin_percent != margin:
+            raise ValueError("margin and margin_percent must match")
+        margin_percent = margin
+    if beat_division is not None and beat_division <= 0:
+        raise ValueError("beat_division must be positive")
+    if margin_percent is not None and not 0.0 < margin_percent <= 100.0:
+        raise ValueError("margin_percent must be between 0 and 100")
+    if fade_in_ms < 0 or fade_out_ms < 0:
+        raise ValueError("fade durations must be non-negative")
     if onset_threshold < 0 or min_separation_ms <= 0 or pre_roll_ms < 0 or window_ms <= 0 or max_alignment_ms < 0:
         raise ValueError("analysis timing values are out of range")
     if bpm is not None and bpm <= 0:
@@ -142,12 +162,18 @@ def analyze_file(
         "spectral_threshold": spectral_threshold,
         "onset_threshold": onset_threshold,
         "min_separation_ms": min_separation_ms,
+        "min_interval_sec": min_separation_ms / 1000.0,
+        "beat_division": beat_division,
+        "margin_percent": margin_percent,
+        "margin": margin_percent,
         "pre_roll_ms": pre_roll_ms,
         "window_ms": window_ms,
         "max_alignment_ms": max_alignment_ms,
         "bpm": bpm,
         "offset": offset,
         "subdivision": subdivision,
+        "fade_in_ms": fade_in_ms,
+        "fade_out_ms": fade_out_ms,
     }
     report(100, "Analysis complete")
     return AnalysisResult(str(path), audio.sample_rate, audio.duration, hits, comparisons, plan, settings, _sha256(path))
