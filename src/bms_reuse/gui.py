@@ -119,6 +119,7 @@ def localize_progress(message: str) -> str:
 
 DARK_STYLE = """
 QMainWindow, QWidget { background: #101317; color: #f5f7fb; font-family: "Yu Gothic UI", "Meiryo UI", "Segoe UI"; font-size: 10pt; }
+QLabel, QCheckBox { background: transparent; }
 QFrame#Panel, QFrame#DropZone, QGroupBox { background: #1b1f26; border: 1px solid #2b323d; border-radius: 12px; }
 QFrame#DropZone { border: 1px dashed #3d8bfd; background: #161c24; }
 QFrame#DropZone[dragActive="true"] { background: #1c3350; border: 1px solid #007aff; }
@@ -141,10 +142,9 @@ QPushButton#Primary { background: #007aff; border-color: #007aff; color: #ffffff
 QPushButton#Primary:hover { background: #0a84ff; border-color: #0a84ff; }
 QPushButton#Primary:pressed { background: #006ee6; border-color: #006ee6; }
 QPushButton#Danger { background: #42222b; border-color: #ff375f; color: #ffd7df; }
-QCheckBox { spacing: 7px; color: #d7dce5; }
-QCheckBox::indicator { width: 15px; height: 15px; }
-QCheckBox::indicator:unchecked { background: #15191f; border: 1px solid #4b5768; border-radius: 4px; }
-QCheckBox::indicator:checked { background: #007aff; border: 1px solid #007aff; border-radius: 4px; }
+QCheckBox { spacing: 8px; padding: 2px 0; color: #d7dce5; }
+QCheckBox:hover { color: #ffffff; }
+QCheckBox:pressed { color: #b7d3ff; }
 QGroupBox { margin-top: 10px; padding: 16px 12px 12px 12px; font-weight: 700; color: #c8defc; }
 QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; }
 QTableWidget { background: #171b22; alternate-background-color: #1c222b; border: 1px solid #2b323d; border-radius: 10px; gridline-color: #242b35; selection-background-color: #244e7a; selection-color: #ffffff; }
@@ -162,6 +162,7 @@ QToolTip { background: #222a35; color: #ffffff; border: 1px solid #4b5768; paddi
 
 LIGHT_STYLE = """
 QMainWindow, QWidget { background: #f3f5f8; color: #1c2430; font-family: "Yu Gothic UI", "Meiryo UI", "Segoe UI"; font-size: 10pt; }
+QLabel, QCheckBox { background: transparent; }
 QFrame#Panel, QFrame#DropZone, QGroupBox { background: #ffffff; border: 1px solid #e1e6ed; border-radius: 12px; }
 QFrame#DropZone { border: 1px dashed #79aef0; background: #f4f8ff; }
 QFrame#DropZone[dragActive="true"] { background: #e4f0ff; border: 1px solid #007aff; }
@@ -184,10 +185,9 @@ QPushButton#Primary { background: #007aff; border-color: #007aff; color: #ffffff
 QPushButton#Primary:hover { background: #0a84ff; border-color: #0a84ff; }
 QPushButton#Primary:pressed { background: #006ee6; border-color: #006ee6; }
 QPushButton#Danger { background: #fff0f3; border-color: #ff375f; color: #b4233f; }
-QCheckBox { spacing: 7px; color: #334155; }
-QCheckBox::indicator { width: 15px; height: 15px; }
-QCheckBox::indicator:unchecked { background: #ffffff; border: 1px solid #b7c1ce; border-radius: 4px; }
-QCheckBox::indicator:checked { background: #007aff; border: 1px solid #007aff; border-radius: 4px; }
+QCheckBox { spacing: 8px; padding: 2px 0; color: #334155; }
+QCheckBox:hover { color: #102033; }
+QCheckBox:pressed { color: #2f6fba; }
 QGroupBox { margin-top: 10px; padding: 16px 12px 12px 12px; font-weight: 700; color: #2f6fba; }
 QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; }
 QTableWidget { background: #ffffff; alternate-background-color: #f7f9fc; border: 1px solid #e1e6ed; border-radius: 10px; gridline-color: #e8edf3; selection-background-color: #d8eaff; selection-color: #102033; }
@@ -439,9 +439,9 @@ class MetricCard(QFrame):
     def __init__(self, caption: str, accent: str, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("Panel")
-        self.setMinimumHeight(78)
+        self.setMinimumHeight(84)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(13, 10, 13, 10)
+        layout.setContentsMargins(16, 12, 16, 12)
         self.value = QLabel("—")
         self.value.setObjectName("Value")
         self.value.setStyleSheet(f"color:{accent};")
@@ -538,7 +538,18 @@ class MainWindow(QMainWindow):
 
         settings_box = QGroupBox("解析設定")
         settings_form = QFormLayout(settings_box)
+        settings_form.setContentsMargins(0, 4, 0, 0)
+        settings_form.setHorizontalSpacing(12)
+        settings_form.setVerticalSpacing(7)
         settings_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        def add_setting_row(caption: str, field: QWidget) -> None:
+            settings_form.addRow(caption, field)
+            label = settings_form.labelForField(field)
+            if label:
+                label.setFixedWidth(126)
+                label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
         self.instrument_combo = QComboBox()
         for key, label in INSTRUMENT_LABELS.items():
             self.instrument_combo.addItem(label, key)
@@ -573,25 +584,27 @@ class MainWindow(QMainWindow):
         self.subdivision_spin = QSpinBox()
         self.subdivision_spin.setRange(1, 128)
         self.subdivision_spin.setValue(16)
-        settings_form.addRow("楽器", self.instrument_combo)
-        settings_form.addRow("同一判定しきい値", self.threshold_spin)
-        settings_form.addRow("スペクトルしきい値", self.spectral_spin)
-        settings_form.addRow("オンセットしきい値", self.onset_spin)
-        settings_form.addRow("プリロール", self.pre_roll_spin)
-        settings_form.addRow("ウィンドウ長", self.window_spin)
-        settings_form.addRow("BPM（必須）", self.bpm_spin)
-        settings_form.addRow("最小間隔（拍）", self.beat_division_combo)
-        settings_form.addRow("マージン(%)", self.margin_spin)
-        settings_form.addRow("", self.bpm_error_label)
-        settings_form.addRow("フェードイン(ms)", self.fade_in_spin)
-        settings_form.addRow("フェードアウト(ms)", self.fade_out_spin)
-        settings_form.addRow("グリッドオフセット", self.offset_spin)
-        settings_form.addRow("分割数", self.subdivision_spin)
-        settings_form.addRow("最大アライメント", self.alignment_spin)
+        add_setting_row("楽器", self.instrument_combo)
+        add_setting_row("同一判定しきい値", self.threshold_spin)
+        add_setting_row("スペクトルしきい値", self.spectral_spin)
+        add_setting_row("オンセットしきい値", self.onset_spin)
+        add_setting_row("プリロール", self.pre_roll_spin)
+        add_setting_row("ウィンドウ長", self.window_spin)
+        add_setting_row("BPM（必須）", self.bpm_spin)
+        add_setting_row("最小間隔（拍）", self.beat_division_combo)
+        add_setting_row("マージン(%)", self.margin_spin)
+        add_setting_row("", self.bpm_error_label)
+        add_setting_row("フェードイン(ms)", self.fade_in_spin)
+        add_setting_row("フェードアウト(ms)", self.fade_out_spin)
+        add_setting_row("グリッドオフセット", self.offset_spin)
+        add_setting_row("分割数", self.subdivision_spin)
+        add_setting_row("最大アライメント", self.alignment_spin)
         left_layout.addWidget(settings_box)
 
         output_box = QGroupBox("出力")
         output_layout = QVBoxLayout(output_box)
+        output_layout.setContentsMargins(0, 4, 0, 0)
+        output_layout.setSpacing(8)
         self.json_edit = QLineEdit()
         self.samples_edit = QLineEdit()
         self.csv_edit = QLineEdit()
@@ -758,13 +771,16 @@ class MainWindow(QMainWindow):
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(5)
+        layout.setSpacing(8)
         label = QLabel(caption)
-        label.setMinimumWidth(52)
+        label.setFixedWidth(72)
+        label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         layout.addWidget(label)
         layout.addWidget(edit, 1)
-        button = QPushButton("…")
-        button.setFixedWidth(30)
+        button = QPushButton("参照…")
+        button.setMinimumWidth(72)
+        button.setAccessibleName(f"{caption}の保存先を参照")
+        button.setToolTip(f"{caption}の保存先を選択")
         button.clicked.connect(callback)
         layout.addWidget(button)
         return widget
