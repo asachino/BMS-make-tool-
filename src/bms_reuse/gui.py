@@ -52,16 +52,22 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised by the CLI-only install
     raise RuntimeError("GUI requires PySide6. Install with: pip install .[gui]") from exc
 
-from .application import AnalysisCancelled, AnalysisResult, analyze_file, record_output_timing
+from .application import AnalysisCancelled, AnalysisResult, analyze_file, exclude_hit, record_output_timing, refresh_reproducibility
+from .batch import run_batch
 from ._numeric import np
 from .audio.loader import load_audio, mono_signal
 from .export.csv_exporter import write_hits_csv
 from .export.json_exporter import write_json
 from .export.wav_exporter import write_hit_wavs
+from .export.bms_exporter import relative_sample_prefix, write_bms
+from .export.bmson_exporter import write_bmson
+from .export.quality import validate_exports
+from .project.presets import load_preset, save_preset
+from .clustering.reuse_plan import Cluster
 
 
 APP_NAME = "StemReuse"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 CLASS_COLORS = {
     "BASE": "#60a5fa",
@@ -70,6 +76,7 @@ CLASS_COLORS = {
     "DIFFERENT": "#fb7185",
     "UNSURE": "#c084fc",
     "OVERLAP": "#f97316",
+    "IGNORED": "#64748b",
 }
 
 CLASS_LABELS = {
@@ -79,6 +86,7 @@ CLASS_LABELS = {
     "DIFFERENT": "別音",
     "UNSURE": "判定保留",
     "OVERLAP": "音の重なり",
+    "IGNORED": "除外",
 }
 
 FILTER_LABELS = {
@@ -89,6 +97,8 @@ FILTER_LABELS = {
     "DIFFERENT": "別音",
     "UNSURE": "判定保留",
     "OVERLAP": "音の重なり",
+    "IGNORED": "除外",
+    "REVIEW": "要確認",
 }
 
 INSTRUMENT_LABELS = {
@@ -239,9 +249,13 @@ def classify_hits(result: AnalysisResult) -> list[dict]:
         for hit_id in cluster.hit_ids
     }
     rows: list[dict] = []
+    overrides = result.settings.get("review_overrides", {}) if isinstance(result.settings, dict) else {}
     for hit in result.hits:
         report = report_by_hit.get(hit.id)
         classification = report.classification if report else "BASE"
+        override = overrides.get(str(hit.id)) if isinstance(overrides, dict) else None
+        if override:
+            classification = "IGNORED" if override == "I" else {"S": "SAME", "G": "GAIN_VARIANT", "D": "DIFFERENT"}.get(override, override)
         rows.append(
             {
                 "id": hit.id,
@@ -258,6 +272,9 @@ def classify_hits(result: AnalysisResult) -> list[dict]:
                 "overlap": bool(hit.overlap_warning or (report and report.overlap_warning)),
                 "sample_id": sample_by_hit.get(hit.id, "—"),
                 "cluster_id": cluster_by_hit.get(hit.id),
+                "start": hit.source_start / max(1, result.sample_rate),
+                "end": hit.source_end / max(1, result.sample_rate),
+                "review_override": override,
             }
         )
     return rows
@@ -319,6 +336,7 @@ class AnalysisWorker(QThread):
             if export_dir:
                 self._on_progress(96, "Writing representative samples")
                 audio = load_audio(self.input_path)
+                exported["samples_dir"] = str(export_dir)
                 exported["samples"] = [
                     str(path)
                     for path in write_hit_wavs(
@@ -334,6 +352,28 @@ class AnalysisWorker(QThread):
             if csv_path:
                 self._on_progress(98, "Writing event CSV")
                 exported["csv"] = str(write_hits_csv(csv_path, result.hits, result.plan.events))
+            bms_path = self.outputs.get("bms")
+            if bms_path:
+                exported["bms"] = str(write_bms(
+                    bms_path,
+                    result.plan,
+                    bpm=self.settings.get("bpm"),
+                    offset=float(self.settings.get("offset", 0.0)),
+                    subdivision=int(self.settings.get("subdivision", 16)),
+                    channel=str(self.settings.get("bms_channel", "01")),
+                    wav_prefix=relative_sample_prefix(bms_path, self.outputs.get("samples")),
+                ))
+            bmson_path = self.outputs.get("bmson")
+            if bmson_path:
+                exported["bmson"] = str(write_bmson(
+                    bmson_path,
+                    result.plan,
+                    bpm=self.settings.get("bpm"),
+                    offset=float(self.settings.get("offset", 0.0)),
+                ))
+            exported["validation"] = validate_exports(result, exported)
+            result.settings["validation"] = exported["validation"]
+            result.settings["exports"] = {key: value for key, value in exported.items() if key != "validation"}
             record_output_timing(result, time.perf_counter() - output_started)
             if json_path:
                 exported["json"] = str(write_json(json_path, result.to_dict()))
@@ -341,6 +381,35 @@ class AnalysisWorker(QThread):
             self.result_ready.emit(result, exported)
         except AnalysisCancelled:
             self.canceled.emit()
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class BatchWorker(QThread):
+    """Run folder analysis off the UI thread and keep failed inputs in a manifest."""
+
+    progress = Signal(int, str)
+    result_ready = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, folder: Path, output_dir: Path, settings: dict, parent: QObject | None = None):
+        super().__init__(parent)
+        self.folder = folder
+        self.output_dir = output_dir
+        self.settings = settings
+
+    def run(self) -> None:
+        try:
+            manifest = run_batch(
+                self.folder,
+                output_dir=self.output_dir,
+                recursive=True,
+                progress=lambda percent, message: self.progress.emit(percent, message),
+                export_bms=True,
+                export_bmson=True,
+                **self.settings,
+            )
+            self.result_ready.emit(manifest)
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -550,6 +619,41 @@ class WaveformCanvas(QWidget):
             painter.setPen(QColor("#64748b"))
             painter.drawText(rect, Qt.AlignCenter, "入力WAVを選択すると波形を表示")
 
+        # BMS grid: subdivision is per beat; every fourth beat is a measure.
+        if owner.bpm and owner.bpm > 0:
+            step = 60.0 / owner.bpm / max(1, owner.subdivision)
+            grid_time = owner.offset + max(0, int((start - owner.offset) / step) - 1) * step
+            while grid_time <= end + step:
+                if grid_time >= start:
+                    fraction = (grid_time - start) / max(visible, 1e-9)
+                    x = rect.left() + round(fraction * rect.width())
+                    beat_index = round((grid_time - owner.offset) / step)
+                    if beat_index % (owner.subdivision * 4) == 0:
+                        color, width, label = QColor("#6484a6"), 2, f"小節{beat_index // (owner.subdivision * 4) + 1}"
+                    elif beat_index % owner.subdivision == 0:
+                        color, width, label = QColor("#3f5d7e"), 1, "拍"
+                    else:
+                        color, width, label = QColor("#263e58"), 1, ""
+                    painter.setPen(QPen(color, width))
+                    painter.drawLine(x, rect.top(), x, rect.bottom())
+                    if label:
+                        painter.setPen(color)
+                        painter.drawText(x + 3, rect.top() + 12, label)
+                grid_time += step
+
+        # Show each extracted source range as a quiet band behind its marker.
+        if owner.rows and owner.sample_rate > 0:
+            for row in owner.rows:
+                band_start = float(row.get("start", row.get("time", 0.0)))
+                band_end = float(row.get("end", band_start))
+                if band_end < start or band_start > end:
+                    continue
+                left_x = rect.left() + round((band_start - start) / max(visible, 1e-9) * rect.width())
+                right_x = rect.left() + round((band_end - start) / max(visible, 1e-9) * rect.width())
+                color = QColor(CLASS_COLORS.get(row["classification"], "#94a3b8"))
+                color.setAlpha(32)
+                painter.fillRect(max(rect.left(), left_x), rect.top(), max(1, min(rect.right(), right_x) - max(rect.left(), left_x)), rect.height(), color)
+
         nearest_id = None
         if owner.rows and owner.position >= 0:
             nearest = min(owner.rows, key=lambda row: abs(float(row["time"]) - owner.position))
@@ -588,6 +692,10 @@ class WaveformView(QWidget):
         self.setMinimumHeight(235)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.duration = 0.0
+        self.sample_rate = 0
+        self.bpm: float | None = None
+        self.offset = 0.0
+        self.subdivision = 16
         self.position = 0.0
         self.rows: list[dict] = []
         self.selected_id: int | None = None
@@ -738,6 +846,10 @@ class WaveformView(QWidget):
         else:
             self.duration = self.audio.duration if self.audio is not None else result.duration
             self.rows = classify_hits(result)
+            self.sample_rate = result.sample_rate
+            self.bpm = result.settings.get("bpm")
+            self.offset = float(result.settings.get("offset", 0.0) or 0.0)
+            self.subdivision = int(result.settings.get("subdivision", 16) or 16)
             self.selected_id = self.rows[0]["id"] if self.rows else None
             self.playback_hint_label.setText("色と文字で分類を表示 · 波形クリックでシーク")
         self._set_position(self.position)
@@ -894,6 +1006,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.settings_store = QSettings("StemReuse", "BMSReuseAnalyzer")
         self.worker: AnalysisWorker | None = None
+        self.batch_worker: BatchWorker | None = None
         self.result: AnalysisResult | None = None
         self.rows: list[dict] = []
         self.exported: dict[str, object] = {}
@@ -944,6 +1057,16 @@ class MainWindow(QMainWindow):
         open_button.setToolTip("解析するPCM WAVステムを選択（Ctrl+O）")
         open_button.clicked.connect(self._browse_input)
         header.addWidget(open_button)
+        preset_load_button = QPushButton("設定読込")
+        preset_load_button.clicked.connect(self._load_preset)
+        header.addWidget(preset_load_button)
+        preset_save_button = QPushButton("設定保存")
+        preset_save_button.clicked.connect(self._save_preset)
+        header.addWidget(preset_save_button)
+        batch_button = QPushButton("フォルダ一括")
+        batch_button.setToolTip("フォルダ内のWAVをまとめて解析")
+        batch_button.clicked.connect(self._browse_batch)
+        header.addWidget(batch_button)
         root_layout.addLayout(header)
 
         title = QHBoxLayout()
@@ -1026,6 +1149,10 @@ class MainWindow(QMainWindow):
         self.fast_compare_check = QCheckBox("高速比較（代表順が変わる場合があります）")
         self.fast_compare_check.setAccessibleName("高速比較（代表順が変わる場合があります）")
         self.fast_compare_check.setToolTip("特徴量に近い代表から比較します。結果の代表順が変わる可能性があります。")
+        self.bms_channel_combo = QComboBox()
+        self.bms_channel_combo.addItem("BGM 01（互換）", "01")
+        self.bms_channel_combo.addItem("1Pキー 11", "11")
+        self.bms_channel_combo.addItem("1Pキー 12", "12")
         add_setting_row("楽器", self.instrument_combo)
         add_setting_row("同一判定しきい値", self.threshold_spin)
         add_setting_row("スペクトルしきい値", self.spectral_spin)
@@ -1042,6 +1169,7 @@ class MainWindow(QMainWindow):
         add_setting_row("分割数", self.subdivision_spin)
         add_setting_row("最大アライメント", self.alignment_spin)
         add_setting_row("比較モード", self.fast_compare_check)
+        add_setting_row("BMSチャンネル", self.bms_channel_combo)
         left_layout.addWidget(settings_box)
 
         output_box = QGroupBox("出力")
@@ -1051,6 +1179,8 @@ class MainWindow(QMainWindow):
         self.json_edit = QLineEdit()
         self.samples_edit = QLineEdit()
         self.csv_edit = QLineEdit()
+        self.bms_edit = QLineEdit()
+        self.bmson_edit = QLineEdit()
         self.csv_check = QCheckBox("イベントCSVを書き出す")
         self.csv_check.setChecked(True)
         self.samples_check = QCheckBox("代表WAVを書き出す")
@@ -1058,6 +1188,8 @@ class MainWindow(QMainWindow):
         output_layout.addWidget(self._path_row("JSON", self.json_edit, self._browse_json))
         output_layout.addWidget(self._path_row("サンプル", self.samples_edit, self._browse_samples))
         output_layout.addWidget(self._path_row("CSV", self.csv_edit, self._browse_csv))
+        output_layout.addWidget(self._path_row("BMS", self.bms_edit, self._browse_bms))
+        output_layout.addWidget(self._path_row("BMSON", self.bmson_edit, self._browse_bmson))
         output_layout.addWidget(self.samples_check)
         output_layout.addWidget(self.csv_check)
         left_layout.addWidget(output_box)
@@ -1132,6 +1264,10 @@ class MainWindow(QMainWindow):
             self.filter_combo.addItem(label, key)
         self.filter_combo.currentIndexChanged.connect(self._refresh_table)
         filter_row.addWidget(self.filter_combo)
+        self.next_review_button = QPushButton("次の要確認")
+        self.next_review_button.setToolTip("判定保留・音の重なりを順番に確認")
+        self.next_review_button.clicked.connect(self._select_next_review)
+        filter_row.addWidget(self.next_review_button)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("ヒット番号または時刻で絞り込み…")
         self.search_edit.textChanged.connect(self._refresh_table)
@@ -1202,6 +1338,14 @@ class MainWindow(QMainWindow):
         self.shortcut_cancel.activated.connect(self.cancel_analysis)
         self.shortcut_play = QShortcut(QKeySequence("Space"), self)
         self.shortcut_play.activated.connect(self._play_selected)
+        self.shortcut_same = QShortcut(QKeySequence("S"), self)
+        self.shortcut_same.activated.connect(lambda: self._apply_review("S"))
+        self.shortcut_gain = QShortcut(QKeySequence("G"), self)
+        self.shortcut_gain.activated.connect(lambda: self._apply_review("G"))
+        self.shortcut_different = QShortcut(QKeySequence("D"), self)
+        self.shortcut_different.activated.connect(lambda: self._apply_review("D"))
+        self.shortcut_ignore = QShortcut(QKeySequence("I"), self)
+        self.shortcut_ignore.activated.connect(lambda: self._apply_review("I"))
 
     @staticmethod
     def _double_spin(value, minimum, maximum, step, decimals, suffix: str = "") -> QDoubleSpinBox:
@@ -1270,6 +1414,8 @@ class MainWindow(QMainWindow):
         self.json_edit.setText(str(path.with_suffix(".bra.json")))
         self.samples_edit.setText(str(path.parent / f"{path.stem}_keysounds"))
         self.csv_edit.setText(str(path.with_suffix(".csv")))
+        self.bms_edit.setText(str(path.with_suffix(".bms")))
+        self.bmson_edit.setText(str(path.parent / f"{path.stem}_keysounds" / f"{path.stem}.bmson"))
         self._log(f"入力を選択しました: {path}")
         self._update_start_enabled()
 
@@ -1295,6 +1441,111 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "代表WAVフォルダ", current)
         if path:
             self.samples_edit.setText(path)
+
+    def _browse_bms(self) -> None:
+        current = self.bms_edit.text() or str(Path.home() / "chart.bms")
+        path, _ = QFileDialog.getSaveFileName(self, "BMSの保存先", current, "BMS (*.bms)")
+        if path:
+            self.bms_edit.setText(path)
+
+    def _browse_bmson(self) -> None:
+        current = self.bmson_edit.text() or str(Path.home() / "chart.bmson")
+        path, _ = QFileDialog.getSaveFileName(self, "BMSONの保存先", current, "BMSON (*.bmson);;JSON (*.json)")
+        if path:
+            self.bmson_edit.setText(path)
+
+    def _browse_batch(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self._bpm_is_valid():
+            self._show_error("BPMが必要です", self._bpm_error_text())
+            return
+        folder = QFileDialog.getExistingDirectory(self, "一括解析するフォルダ", str(Path.home()))
+        if not folder:
+            return
+        output = QFileDialog.getExistingDirectory(self, "一括出力フォルダ", str(Path(folder) / "bms-reuse-batch"))
+        if not output:
+            return
+        try:
+            settings = self._settings()
+        except ValueError as exc:
+            self._show_error("解析設定が正しくありません", str(exc))
+            return
+        self.batch_worker = BatchWorker(Path(folder), Path(output), settings, self)
+        self.batch_worker.progress.connect(lambda percent, message: self._on_progress(percent, message))
+        self.batch_worker.result_ready.connect(self._on_batch_result)
+        self.batch_worker.failed.connect(self._on_batch_failed)
+        self._processing_stage = "一括解析中"
+        self.status_label.setText("一括解析中…")
+        self._log(f"一括解析を開始: {folder}")
+        self.batch_worker.start()
+
+    @Slot(object)
+    def _on_batch_result(self, manifest: dict) -> None:
+        self.status_label.setText("一括解析完了")
+        self._processing_stage = "一括解析完了"
+        self._log(f"一括解析完了: {manifest.get('success', 0)}/{manifest.get('count', 0)}件 · manifest.json")
+
+    @Slot(str)
+    def _on_batch_failed(self, details: str) -> None:
+        self.status_label.setText("一括解析エラー")
+        self._processing_stage = "一括解析エラー"
+        self._log(f"一括解析エラー: {details}")
+
+    def _preset_settings(self) -> dict:
+        return self._settings()
+
+    def _save_preset(self) -> None:
+        try:
+            settings = self._preset_settings()
+        except ValueError as exc:
+            self._show_error("設定を保存できません", str(exc))
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "解析プリセットを保存", str(Path.home() / "bms-reuse.preset.json"), "JSON (*.json)")
+        if path:
+            save_preset(path, settings)
+            self._log(f"プリセットを保存しました: {path}")
+
+    def _load_preset(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "解析プリセットを開く", str(Path.home()), "JSON (*.json)")
+        if not path:
+            return
+        try:
+            values = load_preset(path)
+            widgets = {
+                "threshold": self.threshold_spin,
+                "spectral_threshold": self.spectral_spin,
+                "onset_threshold": self.onset_spin,
+                "pre_roll_ms": self.pre_roll_spin,
+                "window_ms": self.window_spin,
+                "bpm": self.bpm_spin,
+                "margin_percent": self.margin_spin,
+                "fade_in_ms": self.fade_in_spin,
+                "fade_out_ms": self.fade_out_spin,
+                "offset": self.offset_spin,
+                "max_alignment_ms": self.alignment_spin,
+                "subdivision": self.subdivision_spin,
+            }
+            for key, widget in widgets.items():
+                if key in values:
+                    widget.setValue(float(values[key]))
+            instrument = values.get("instrument")
+            if instrument:
+                index = self.instrument_combo.findData(instrument)
+                if index >= 0:
+                    self.instrument_combo.setCurrentIndex(index)
+            self.fast_compare_check.setChecked(bool(values.get("fast_compare", False)))
+            if "bms_channel" in values:
+                index = self.bms_channel_combo.findData(values["bms_channel"])
+                if index >= 0:
+                    self.bms_channel_combo.setCurrentIndex(index)
+            if "beat_division" in values:
+                index = self.beat_division_combo.findData(int(values["beat_division"]))
+                if index >= 0:
+                    self.beat_division_combo.setCurrentIndex(index)
+            self._log(f"プリセットを読み込みました: {path}")
+        except (OSError, ValueError, TypeError) as exc:
+            self._show_error("プリセットを読み込めません", str(exc))
 
     @staticmethod
     def _same_path(left: str | Path, right: str | Path) -> bool:
@@ -1351,11 +1602,18 @@ class MainWindow(QMainWindow):
             "offset": self.offset_spin.value(),
             "subdivision": self.subdivision_spin.value(),
             "fast_compare": self.fast_compare_check.isChecked(),
+            "bms_channel": self.bms_channel_combo.currentData() or "01",
         }
 
     def _outputs(self) -> dict:
         input_path = Path(self.input_edit.text())
-        output: dict[str, str | None] = {"json": self.json_edit.text().strip() or None, "samples": None, "csv": None}
+        output: dict[str, str | None] = {
+            "json": self.json_edit.text().strip() or None,
+            "samples": None,
+            "csv": None,
+            "bms": self.bms_edit.text().strip() or None,
+            "bmson": self.bmson_edit.text().strip() or None,
+        }
         if self.samples_check.isChecked() and self.samples_edit.text().strip():
             output["samples"] = self.samples_edit.text().strip()
         if self.csv_check.isChecked() and self.csv_edit.text().strip():
@@ -1487,6 +1745,8 @@ class MainWindow(QMainWindow):
             f"比較: {summary.get('comparisons', len(result.comparisons))}件 · "
             f"キャッシュ再利用: {summary.get('comparison_cache_hits', 0)}件 · モード: {mode_label}"
         )
+        validation = exported.get("validation", {}) if isinstance(exported, dict) else {}
+        self._log(f"出力チェック: {'OK' if validation.get('ok', True) else '要確認'}")
         timings = summary.get("timings", {})
         if timings:
             self._log(
@@ -1544,7 +1804,9 @@ class MainWindow(QMainWindow):
         self.hit_table.setSortingEnabled(False)
         self.hit_table.setRowCount(0)
         for row in self.rows:
-            if wanted != "All" and row["classification"] != wanted:
+            if wanted == "REVIEW" and row["classification"] not in {"UNSURE", "OVERLAP"}:
+                continue
+            if wanted not in {"All", "REVIEW"} and row["classification"] != wanted:
                 continue
             haystack = f"{row['id']} {row['time']:.3f} {row['sample_id']}".casefold()
             if query and query not in haystack:
@@ -1572,6 +1834,105 @@ class MainWindow(QMainWindow):
             desired = next((i for i in range(self.hit_table.rowCount()) if self.hit_table.item(i, 0).data(Qt.UserRole) == selected), 0)
             self.hit_table.selectRow(desired)
             self._table_selection_changed(desired, 0, -1, -1)
+
+    def _select_next_review(self) -> None:
+        review_ids = [row["id"] for row in self.rows if row["classification"] in {"UNSURE", "OVERLAP"}]
+        if not review_ids:
+            self._log("要確認のヒットはありません")
+            return
+        current = self._selected_row_id()
+        target = next((hit_id for hit_id in review_ids if current is None or hit_id > current), review_ids[0])
+        for index in range(self.hit_table.rowCount()):
+            item = self.hit_table.item(index, 0)
+            if item and item.data(Qt.UserRole) == target:
+                self.hit_table.selectRow(index)
+                self._table_selection_changed(index, 0, -1, -1)
+                return
+
+    def _apply_review(self, key: str) -> None:
+        hit_id = self._selected_row_id()
+        if hit_id is None or not self.result:
+            return
+        overrides = self.result.settings.setdefault("review_overrides", {})
+        overrides[str(hit_id)] = key
+        row = next((item for item in self.rows if item["id"] == hit_id), None)
+        if key == "D":
+            old_cluster = next((cluster for cluster in self.result.plan.clusters if hit_id in cluster.hit_ids), None)
+            if old_cluster and len(old_cluster.hit_ids) > 1:
+                old_cluster.hit_ids.remove(hit_id)
+                new_id = max((cluster.id for cluster in self.result.plan.clusters), default=0) + 1
+                self.result.plan.clusters.append(Cluster(new_id, hit_id, [hit_id]))
+                for event in self.result.plan.events:
+                    if int(event.get("hit", -1)) == hit_id:
+                        event["sample_id"] = f"sample_{new_id:03d}"
+                self.result.settings.setdefault("review_targets", {})[str(hit_id)] = new_id
+        if row:
+            row["review_override"] = key
+            row["classification"] = "IGNORED" if key == "I" else {"S": "SAME", "G": "GAIN_VARIANT", "D": "DIFFERENT"}[key]
+        # Keep an explicit target for downstream exporters and future cluster UI.
+        if key in {"S", "G"} and row and row.get("cluster_id"):
+            self.result.settings.setdefault("review_targets", {})[str(hit_id)] = row["cluster_id"]
+        if key == "I":
+            exclude_hit(self.result, hit_id)
+        else:
+            refresh_reproducibility(self.result)
+        self.rows = classify_hits(self.result)
+        summary = self.result.summary
+        self.required_card.value.setText(str(summary["required_samples"]))
+        self.hits_card.value.setText(str(summary["detected_hits"]))
+        self.reuse_card.value.setText(f"{summary['reuse_ratio']:.1f}%")
+        self.review_card.value.setText(str(sum(item["classification"] in {"UNSURE", "OVERLAP"} for item in self.rows)))
+        self._refresh_table()
+        self._save_review_state()
+        self._log(f"ヒット{hit_id:03d}を{key}で確定しました")
+
+    def _save_review_state(self) -> None:
+        if not self.result:
+            return
+        json_path = self.json_edit.text().strip()
+        if not json_path:
+            return
+        try:
+            excluded = {int(value) for value in self.result.settings.get("excluded_hits", [])}
+            outputs = self.exported if isinstance(self.exported, dict) else {}
+            sample_paths = outputs.get("samples", [])
+            if isinstance(sample_paths, list) and sample_paths:
+                old_sample_paths = {Path(path).resolve() for path in sample_paths}
+                sample_dir = Path(sample_paths[0]).parent
+                audio = load_audio(self.result.source)
+                outputs["samples"] = [str(path) for path in write_hit_wavs(
+                    sample_dir,
+                    audio,
+                    self.result.hits,
+                    self.result.plan,
+                    fade_in_ms=float(self.result.settings.get("fade_in_ms", 0.0)),
+                    fade_out_ms=float(self.result.settings.get("fade_out_ms", 0.0)),
+                )]
+                new_sample_paths = {Path(path).resolve() for path in outputs["samples"]}
+                for stale in old_sample_paths - new_sample_paths:
+                    if stale.name.startswith("sample_") and stale.suffix.casefold() == ".wav":
+                        stale.unlink(missing_ok=True)
+            if outputs.get("csv"):
+                write_hits_csv(outputs["csv"], self.result.hits, self.result.plan.events, excluded_hits=excluded)
+            if outputs.get("bms"):
+                write_bms(
+                    outputs["bms"],
+                    self.result.plan,
+                    bpm=self.result.settings.get("bpm"),
+                    offset=float(self.result.settings.get("offset", 0.0)),
+                    subdivision=int(self.result.settings.get("subdivision", 16)),
+                    channel=str(self.result.settings.get("bms_channel", "01")),
+                    wav_prefix=relative_sample_prefix(outputs["bms"], Path(outputs["samples"][0]).parent if isinstance(outputs.get("samples"), list) and outputs["samples"] else None),
+                    excluded_hits=excluded,
+                )
+            if outputs.get("bmson"):
+                write_bmson(outputs["bmson"], self.result.plan, bpm=self.result.settings.get("bpm"), offset=float(self.result.settings.get("offset", 0.0)), excluded_hits=excluded)
+            outputs["validation"] = validate_exports(self.result, outputs)
+            self.result.settings["validation"] = outputs["validation"]
+            self.result.settings["exports"] = {key: value for key, value in outputs.items() if key != "validation"}
+            write_json(json_path, self.result.to_dict())
+        except OSError as exc:
+            self._log(f"レビュー保存エラー: {exc}")
 
     def _selected_row_id(self) -> int | None:
         selected = self.hit_table.selectedItems() if hasattr(self, "hit_table") else []
@@ -1680,6 +2041,9 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait(3000)
+        if self.batch_worker and self.batch_worker.isRunning():
+            self.batch_worker.requestInterruption()
+            self.batch_worker.wait(3000)
         self.settings_store.setValue("geometry", self.saveGeometry())
         event.accept()
 

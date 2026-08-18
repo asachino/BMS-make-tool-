@@ -1,6 +1,6 @@
 # BMS Stem Reuse Analyzer
 
-CLI MVP for finding reusable hits in PCM WAV stems.
+CLI/GUI tool for finding reusable hits in PCM WAV stems and preparing BMS key sounds.
 
 ## Build the Windows executable
 
@@ -29,7 +29,7 @@ python gui_launcher.py
 .\build_gui_exe.ps1
 ```
 
-出力は `dist\bms-reuse-gui.exe` です。GUIはWAVのドラッグ＆ドロップ、非同期解析、進捗とキャンセル、分類フィルタ、代表WAV/JSON/CSV出力に対応しています。`Ctrl+O`で入力選択、`Ctrl+Enter`で解析、`Esc`でキャンセル、`Space`で代表WAVを再生できます。
+出力は `dist\bms-reuse-gui.exe` です。GUIはWAVのドラッグ＆ドロップ、BPMグリッド付きタイムライン、非同期解析、要確認レビュー、代表WAV/JSON/CSV/BMS/BMSON出力に対応しています。`Ctrl+O`で入力選択、`Ctrl+Enter`で解析、`Esc`でキャンセル、`Space`で代表WAVを再生、`S/G/D/I`でレビュー確定できます。設定プリセットとフォルダ一括解析も利用できます。
 
 類似度判定は位置合わせ後のゲイン正規化波形とスペクトルを優先し、微小ノイズや音量差を許容します。判定プロファイル、実効しきい値、位置合わせ幅、重なり警告は解析JSONに記録されます。
 
@@ -44,3 +44,21 @@ dist\bms-reuse.exe analyze kick_stem.wav `
 
 比較順を特徴量の近い代表から始める明示的な高速モードは
 `--fast-compare` で有効化できます。代表順と判定結果が変わる可能性があるため、指定しない場合は通常モードです。
+
+BMS/BMSON出力には`--bpm`が必須です。解析だけならBPMなしで実行できます。
+
+```powershell
+dist\bms-reuse.exe analyze kick_stem.wav `
+  --output project.bra.json --export-dir keysounds --csv events.csv `
+  --bpm 174 --bms chart.bms --bmson keysounds\chart.bmson
+```
+
+BMSONの音声名はチャートから見たbasenameなので、BMSONは代表WAVと同じフォルダに出力します。BMSは`--bms-channel 01`（BGM互換、警告付き）が既定で、プレイ可能なキー音には`11`以降を指定できます。
+
+フォルダ一括解析:
+
+```powershell
+dist\bms-reuse.exe batch .\stems --recursive --output-dir .\batch-out --bpm 174 --bms --bmson
+```
+
+各入力のサブフォルダと`manifest.json`が生成され、壊れた入力があっても残りを継続します。

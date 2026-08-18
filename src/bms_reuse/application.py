@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -22,6 +23,9 @@ from .features.feature_extractor import extract_features
 from .project.model import Project
 from .similarity.score import SimilarityReport, compare_hits
 from .audio.loader import load_audio, mono_signal
+
+
+ANALYSIS_VERSION = "0.3.0"
 
 
 @dataclass
@@ -65,7 +69,38 @@ class AnalysisResult:
             reuse_plan=self.plan.to_dict(),
         )
         data = project.to_dict()
-        data.update({"source_hash": self.source_hash, "sample_rate": self.sample_rate, "duration": self.duration, "summary": self.summary})
+        settings = self.settings
+        repro = settings.get("reproducibility", {}) if isinstance(settings, dict) else {}
+        grid = {
+            "bpm": settings.get("bpm"),
+            "offset": settings.get("offset", 0.0),
+            "subdivision": settings.get("subdivision", 16),
+            "beat_division": settings.get("beat_division"),
+            "margin_percent": settings.get("margin_percent"),
+            "min_interval_sec": settings.get("min_interval_sec"),
+        }
+        data.update({
+            "schema_version": 2,
+            "source_hash": self.source_hash,
+            "sample_rate": self.sample_rate,
+            "duration": self.duration,
+            "analysis_version": ANALYSIS_VERSION,
+            "metadata": {
+                "source_hash": self.source_hash,
+                "analysis_version": ANALYSIS_VERSION,
+                "reproducibility_hash": repro.get("reproducibility_hash", settings.get("settings_hash", "")),
+                "settings_hash": repro.get("settings_hash", settings.get("settings_hash", "")),
+                "grid": grid,
+            },
+            "review": {
+                "overrides": settings.get("review_overrides", {}),
+                "targets": settings.get("review_targets", {}),
+                "excluded_hits": settings.get("excluded_hits", []),
+            },
+            "validation": settings.get("validation", {}),
+            "exports": settings.get("exports", {}),
+            "summary": self.summary,
+        })
         return data
 
 
@@ -106,6 +141,83 @@ def record_output_timing(result: AnalysisResult, output_seconds: float) -> None:
     timings["total_seconds"] = round(float(timings.get("analysis_seconds", 0.0)) + output_seconds, 6)
 
 
+def refresh_reproducibility(result: AnalysisResult) -> None:
+    """Recompute review-aware hashes after a human changes the plan."""
+    settings = result.settings
+    stable_settings = {
+        key: value
+        for key, value in settings.items()
+        if key not in {
+            "timings", "comparison_count", "comparison_cache_hits", "comparison_cache_entries",
+            "settings_hash", "reproducibility_hash", "reproducibility", "validation", "exports",
+        }
+    }
+    canonical = json.dumps(stable_settings, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    settings_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    reproducibility_hash = hashlib.sha256(f"{result.source_hash}:{settings_hash}:{ANALYSIS_VERSION}".encode("utf-8")).hexdigest()
+    settings["settings_hash"] = settings_hash
+    settings["reproducibility_hash"] = reproducibility_hash
+    settings["reproducibility"] = {
+        "source_hash": result.source_hash,
+        "settings_hash": settings_hash,
+        "reproducibility_hash": reproducibility_hash,
+        "analysis_version": ANALYSIS_VERSION,
+    }
+
+
+def _safe_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def exclude_hit(result: AnalysisResult, hit_id: int) -> None:
+    """Remove one reviewed hit from the reusable plan and all exports."""
+    hit_id = int(hit_id)
+    result.hits[:] = [hit for hit in result.hits if hit.id != hit_id]
+    result.comparisons[:] = [
+        report for report in result.comparisons
+        if report.reference_id != hit_id and report.candidate_id != hit_id
+    ]
+    retained_clusters = []
+    old_cluster_ids: dict[int, int] = {}
+    for cluster in result.plan.clusters:
+        cluster.hit_ids[:] = [value for value in cluster.hit_ids if value != hit_id]
+        if cluster.hit_ids:
+            if cluster.representative_hit == hit_id:
+                cluster.representative_hit = cluster.hit_ids[0]
+            retained_clusters.append(cluster)
+    result.plan.clusters[:] = retained_clusters
+    for index, cluster in enumerate(result.plan.clusters, 1):
+        old_cluster_ids[int(cluster.id)] = index
+        cluster.id = index
+    targets = result.settings.get("review_targets", {})
+    if isinstance(targets, dict):
+        result.settings["review_targets"] = {
+            str(target_hit): old_cluster_ids[int(target_cluster)]
+            for target_hit, target_cluster in targets.items()
+            if str(target_hit) != str(hit_id)
+            and _safe_int(target_cluster) in old_cluster_ids
+        }
+    cluster_by_hit = {
+        hit: cluster.id
+        for cluster in result.plan.clusters
+        for hit in cluster.hit_ids
+    }
+    result.plan.events[:] = [
+        dict(event, sample_id=f"sample_{cluster_by_hit[event['hit']]:03d}")
+        for event in result.plan.events
+        if int(event.get("hit", -1)) != hit_id and int(event.get("hit", -1)) in cluster_by_hit
+    ]
+    excluded = result.settings.setdefault("excluded_hits", [])
+    if hit_id not in excluded:
+        excluded.append(hit_id)
+    overrides = result.settings.setdefault("review_overrides", {})
+    overrides[str(hit_id)] = "I"
+    refresh_reproducibility(result)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -137,6 +249,7 @@ def analyze_file(
     fade_in_ms: float = 0.0,
     fade_out_ms: float = 0.0,
     fast_compare: bool = False,
+    bms_channel: str = "01",
 ) -> AnalysisResult:
     analysis_started = time.perf_counter()
 
@@ -169,6 +282,9 @@ def analyze_file(
         raise ValueError("bpm must be positive")
     if subdivision <= 0:
         raise ValueError("subdivision must be positive")
+    if len(str(bms_channel)) != 2 or not str(bms_channel).isdigit():
+        raise ValueError("bms_channel must be a two-digit decimal channel")
+    bms_channel = str(bms_channel).upper()
     timings = {
         "load_seconds": 0.0,
         "onset_seconds": 0.0,
@@ -272,6 +388,7 @@ def analyze_file(
     if not audio.frame_count:
         for key in timings:
             timings[key] = 0.0
+    source_hash = _sha256(path)
     settings = {
         "instrument": instrument,
         "threshold": threshold,
@@ -291,6 +408,7 @@ def analyze_file(
         "subdivision": subdivision,
         "fade_in_ms": fade_in_ms,
         "fade_out_ms": fade_out_ms,
+        "bms_channel": bms_channel,
         "similarity_profile": {
             "name": SIMILARITY_PROFILE_NAME,
             "waveform_threshold": threshold,
@@ -306,6 +424,23 @@ def analyze_file(
         "comparison_cache_hits": cache_stats["hits"],
         "comparison_cache_entries": cache_stats["entries"],
         "timings": timings,
+        "analysis_version": ANALYSIS_VERSION,
+    }
+    stable_settings = {
+        key: value
+        for key, value in settings.items()
+        if key not in {"timings", "comparison_count", "comparison_cache_hits", "comparison_cache_entries"}
+    }
+    canonical_settings = json.dumps(stable_settings, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    settings["settings_hash"] = hashlib.sha256(canonical_settings.encode("utf-8")).hexdigest()
+    settings["reproducibility_hash"] = hashlib.sha256(
+        f"{source_hash}:{settings['settings_hash']}:{ANALYSIS_VERSION}".encode("utf-8")
+    ).hexdigest()
+    settings["reproducibility"] = {
+        "source_hash": source_hash,
+        "settings_hash": settings["settings_hash"],
+        "reproducibility_hash": settings["reproducibility_hash"],
+        "analysis_version": ANALYSIS_VERSION,
     }
     report(100, "Analysis complete")
-    return AnalysisResult(str(path), audio.sample_rate, audio.duration, hits, comparisons, plan, settings, _sha256(path))
+    return AnalysisResult(str(path), audio.sample_rate, audio.duration, hits, comparisons, plan, settings, source_hash)
