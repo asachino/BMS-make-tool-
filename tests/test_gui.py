@@ -179,6 +179,64 @@ class GuiSupportTest(unittest.TestCase):
             self.assertAlmostEqual(values[-2], 1.0, places=2)
             self.assertAlmostEqual(values[-1], 0.0, places=4)
 
+    def test_waveform_preview_controls_and_cluster_markers(self):
+        from bms_reuse.gui import WaveformView, classify_hits
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "元音声.wav"
+            signal = [0.0] * 1200
+            signal[100] = 0.8
+            signal[700] = 0.6
+            write_wav(source, signal, 1000)
+            audio = load_audio(source)
+            view = WaveformView()
+            view.set_source_audio(source, audio)
+            self.assertAlmostEqual(view.duration, 1.2)
+            self.assertTrue(view.waveform_points)
+            self.assertEqual(view.playback_play_button.text(), "再生")
+            self.assertEqual(view.playback_pause_button.text(), "一時停止")
+            self.assertEqual(view.playback_stop_button.text(), "停止")
+            self.assertEqual(view.seek_slider.accessibleName(), "元WAV再生位置")
+            view._set_position(0.7)
+            self.assertAlmostEqual(view.position, 0.7)
+            self.assertGreater(view.seek_slider.value(), 0)
+            view.resize(900, 230)
+            self.assertFalse(view.canvas.grab().isNull())
+            result = analyze_file(source, min_separation_ms=300.0, window_ms=200.0)
+            view.set_result(result)
+            rows = classify_hits(result)
+            self.assertTrue(rows)
+            self.assertEqual(view.rows[0]["cluster_id"], rows[0]["cluster_id"])
+            self.assertIn("色と文字", view.playback_hint_label.text())
+            self.assertFalse(view.playback_pause_button.isEnabled())
+            view.shutdown()
+            view.close()
+
+    def test_representative_wav_count_matches_clusters_and_gain_variants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.wav"
+            write_wav(source, [[0.2], [0.3], [0.4], [0.5], [0.6], [0.7]], 1000)
+            audio = load_audio(source)
+            hits = [
+                Hit(1, 0, 0.0, audio.samples[0:2], 0, 2),
+                Hit(2, 2, 0.002, audio.samples[2:4], 2, 4),
+                Hit(3, 4, 0.004, audio.samples[4:6], 4, 6),
+            ]
+            plan = ReusePlan(
+                [Cluster(1, 1, [1, 2]), Cluster(2, 3, [3])],
+                [
+                    {"hit": 1, "sample_id": "sample_001", "gain_db": 0.0},
+                    {"hit": 2, "sample_id": "sample_001", "gain_db": -6.0},
+                    {"hit": 3, "sample_id": "sample_002", "gain_db": 0.0},
+                ],
+            )
+            output = Path(directory) / "representatives"
+            paths = write_hit_wavs(output, audio, hits, plan)
+            self.assertEqual(len(paths), len(plan.clusters))
+            self.assertEqual(len({path.name for path in paths}), len(plan.clusters))
+            self.assertEqual(len(list(output.glob("sample_*.wav"))), len(plan.clusters))
+            self.assertEqual([path.stem for path in paths], ["sample_001", "sample_002"])
+
 
 if __name__ == "__main__":
     unittest.main()

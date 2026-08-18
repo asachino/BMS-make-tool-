@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
+import wave
 from pathlib import Path
 
 try:
@@ -41,6 +43,7 @@ try:
         QSizePolicy,
         QSpinBox,
         QSplitter,
+        QSlider,
         QTableWidget,
         QTableWidgetItem,
         QVBoxLayout,
@@ -50,7 +53,8 @@ except ImportError as exc:  # pragma: no cover - exercised by the CLI-only insta
     raise RuntimeError("GUI requires PySide6. Install with: pip install .[gui]") from exc
 
 from .application import AnalysisCancelled, AnalysisResult, analyze_file, record_output_timing
-from .audio.loader import load_audio
+from ._numeric import np
+from .audio.loader import load_audio, mono_signal
 from .export.csv_exporter import write_hits_csv
 from .export.json_exporter import write_json
 from .export.wav_exporter import write_hit_wavs
@@ -229,6 +233,11 @@ def classify_hits(result: AnalysisResult) -> list[dict]:
         for cluster in result.plan.clusters
         for hit_id in cluster.hit_ids
     }
+    cluster_by_hit = {
+        hit_id: cluster.id
+        for cluster in result.plan.clusters
+        for hit_id in cluster.hit_ids
+    }
     rows: list[dict] = []
     for hit in result.hits:
         report = report_by_hit.get(hit.id)
@@ -248,6 +257,7 @@ def classify_hits(result: AnalysisResult) -> list[dict]:
                 "tail": report.tail_similarity if report else 1.0,
                 "overlap": bool(hit.overlap_warning or (report and report.overlap_warning)),
                 "sample_id": sample_by_hit.get(hit.id, "—"),
+                "cluster_id": cluster_by_hit.get(hit.id),
             }
         )
     return rows
@@ -399,68 +409,464 @@ class DropZone(QFrame):
             super().keyPressEvent(event)
 
 
-class WaveformView(QWidget):
-    hit_selected = Signal(int)
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setMinimumHeight(150)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.duration = 0.0
-        self.rows: list[dict] = []
-        self.selected_id: int | None = None
-        self.setToolTip("ヒットマーカーをクリックして詳細を確認")
-
-    def set_result(self, result: AnalysisResult | None) -> None:
-        if result is None:
-            self.duration, self.rows, self.selected_id = 0.0, [], None
+def _waveform_envelope(audio, max_points: int = 1600) -> list[tuple[float, float]]:
+    """Shrink a long source WAV to min/max buckets for fast QPainter drawing."""
+    frame_count = audio.frame_count
+    if frame_count <= 0:
+        return []
+    signal = mono_signal(audio)
+    bucket_count = min(max_points, frame_count)
+    points: list[tuple[float, float]] = []
+    for index in range(bucket_count):
+        start = index * frame_count // bucket_count
+        end = max(start + 1, (index + 1) * frame_count // bucket_count)
+        chunk = signal[start:end]
+        if np is not None and hasattr(chunk, "shape"):
+            low = float(np.min(chunk))
+            high = float(np.max(chunk))
         else:
-            self.duration = result.duration
-            self.rows = classify_hits(result)
-            self.selected_id = self.rows[0]["id"] if self.rows else None
-        self.update()
+            values = [float(value) for value in chunk]
+            low = min(values, default=0.0)
+            high = max(values, default=0.0)
+        points.append((low, high))
+    return points
 
-    def set_selected(self, hit_id: int | None) -> None:
-        self.selected_id = hit_id
-        self.update()
+
+class PreviewLoadWorker(QThread):
+    loaded = Signal(str, object, object)
+    failed = Signal(str, str)
+
+    def __init__(self, path: Path, parent: QObject | None = None):
+        super().__init__(parent)
+        self.path = path
+
+    def run(self) -> None:
+        try:
+            audio = load_audio(self.path)
+            self.loaded.emit(str(self.path), audio, _waveform_envelope(audio))
+        except Exception as exc:
+            self.failed.emit(str(self.path), str(exc))
+
+
+class PlaybackSegmentWorker(QThread):
+    ready = Signal(str, float)
+    failed = Signal(str)
+
+    def __init__(self, source_path: Path, start_seconds: float, parent: QObject | None = None):
+        super().__init__(parent)
+        self.source_path = source_path
+        self.start_seconds = max(0.0, float(start_seconds))
+
+    def run(self) -> None:
+        target_path: Path | None = None
+        try:
+            with wave.open(str(self.source_path), "rb") as source:
+                rate = source.getframerate()
+                start_frame = min(source.getnframes(), round(self.start_seconds * rate))
+                source.setpos(start_frame)
+                handle = tempfile.NamedTemporaryFile(prefix="bms-reuse-preview-", suffix=".wav", delete=False)
+                target_path = Path(handle.name)
+                handle.close()
+                with wave.open(str(target_path), "wb") as target:
+                    target.setparams(source.getparams())
+                    while not self.isInterruptionRequested():
+                        chunk = source.readframes(65536)
+                        if not chunk:
+                            break
+                        target.writeframesraw(chunk)
+                    target.writeframes(b"")
+            if self.isInterruptionRequested():
+                target_path.unlink(missing_ok=True)
+                return
+            self.ready.emit(str(target_path), self.start_seconds)
+        except Exception as exc:
+            if target_path:
+                target_path.unlink(missing_ok=True)
+            self.failed.emit(str(exc))
+
+
+class WaveformCanvas(QWidget):
+    clicked = Signal(float)
+
+    def __init__(self, owner: "WaveformView", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.owner = owner
+        self.setMinimumHeight(155)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def mousePressEvent(self, event) -> None:
-        if not self.rows or self.duration <= 0:
-            return
-        x = max(0, min(self.width() - 1, event.position().x()))
-        target = min(self.rows, key=lambda row: abs(row["time"] / self.duration * self.width() - x))
-        self.selected_id = target["id"]
-        self.hit_selected.emit(target["id"])
-        self.update()
+        if event.button() == Qt.LeftButton and self.owner.duration > 0:
+            rect = self.rect().adjusted(10, 8, -10, -28)
+            fraction = max(0.0, min(1.0, (event.position().x() - rect.left()) / max(1, rect.width())))
+            start, visible = self.owner._view_range()
+            position = start + fraction * visible
+            self.clicked.emit(position)
+            if self.owner.rows:
+                target = min(self.owner.rows, key=lambda row: abs(float(row["time"]) - position))
+                self.owner.selected_id = target["id"]
+                self.owner.hit_selected.emit(target["id"])
+                self.update()
+        super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:
+        owner = self.owner
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        rect = self.rect().adjusted(12, 10, -12, -24)
         painter.fillRect(self.rect(), QColor("#0a1220"))
+        rect = self.rect().adjusted(10, 8, -10, -28)
+        duration = owner.duration
+        if duration <= 0:
+            painter.setPen(QColor("#64748b"))
+            painter.drawText(rect, Qt.AlignCenter, "解析後に表示")
+            return
+
+        start, visible = owner._view_range()
+        end = start + visible
         painter.setPen(QPen(QColor("#1e3a5f"), 1))
         for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
             x = rect.left() + round(rect.width() * fraction)
             painter.drawLine(x, rect.top(), x, rect.bottom())
             painter.setPen(QColor("#64748b"))
-            painter.drawText(x + 3, self.height() - 7, format_seconds(self.duration * fraction))
+            painter.drawText(x + 3, self.height() - 8, format_seconds(start + visible * fraction))
             painter.setPen(QPen(QColor("#1e3a5f"), 1))
+        center = rect.center().y()
         painter.setPen(QPen(QColor("#27435e"), 1))
-        painter.drawLine(rect.left(), rect.center().y(), rect.right(), rect.center().y())
-        if not self.rows:
+        painter.drawLine(rect.left(), center, rect.right(), center)
+
+        points = owner.waveform_points
+        if points:
+            painter.setPen(QPen(QColor("#72b7ff"), 1))
+            denominator = max(1, len(points) - 1)
+            half_height = max(1, rect.height() // 2 - 3)
+            for index, (low, high) in enumerate(points):
+                point_time = duration * index / denominator
+                if point_time < start or point_time > end:
+                    continue
+                x = rect.left() + round((point_time - start) / max(visible, 1e-9) * rect.width())
+                top = center - round(max(-1.0, min(1.0, high)) * half_height)
+                bottom = center - round(max(-1.0, min(1.0, low)) * half_height)
+                painter.drawLine(x, top, x, bottom)
+        elif not owner.source_path:
             painter.setPen(QColor("#64748b"))
-            painter.drawText(rect, Qt.AlignCenter, "解析タイムライン · WAVをドロップして開始")
-            return
-        for row in self.rows:
-            x = rect.left() + round(rect.width() * row["time"] / max(self.duration, 1e-9))
+            painter.drawText(rect, Qt.AlignCenter, "入力WAVを選択すると波形を表示")
+
+        nearest_id = None
+        if owner.rows and owner.position >= 0:
+            nearest = min(owner.rows, key=lambda row: abs(float(row["time"]) - owner.position))
+            if abs(float(nearest["time"]) - owner.position) <= max(0.04, visible / max(1, len(owner.rows) * 2)):
+                nearest_id = nearest["id"]
+        for marker_index, row in enumerate(owner.rows):
+            marker_time = float(row["time"])
+            if marker_time < start or marker_time > end:
+                continue
+            x = rect.left() + round((marker_time - start) / max(visible, 1e-9) * rect.width())
+            selected = row["id"] == owner.selected_id or row["id"] == nearest_id
             color = QColor(CLASS_COLORS.get(row["classification"], "#94a3b8"))
-            amplitude = max(0.12, min(1.0, (row.get("confidence", 50.0) or 50.0) / 100.0))
-            height = max(5, round(rect.height() * 0.42 * amplitude))
-            painter.setPen(QPen(color, 2 if row["id"] == self.selected_id else 1))
-            painter.drawLine(x, rect.center().y() - height, x, rect.center().y() + height)
-            if row["id"] == self.selected_id:
-                painter.setPen(QPen(QColor("#f8fafc"), 1))
-                painter.drawEllipse(QPoint(x, rect.center().y() - height - 4), 3, 3)
+            painter.setPen(QPen(color, 3 if selected else 1))
+            painter.drawLine(x, rect.top(), x, rect.bottom())
+            label = f"C{row.get('cluster_id') or '?'} {CLASS_LABELS.get(row['classification'], row['classification'])}"
+            painter.setPen(color)
+            painter.drawText(x + 3, rect.top() + 15 + (marker_index % 3) * 15, label)
+            if selected:
+                painter.setBrush(color)
+                painter.drawEllipse(QPoint(x, rect.top() - 1), 3, 3)
+                painter.setBrush(Qt.NoBrush)
+
+        if owner.position <= duration:
+            x = rect.left() + round((owner.position - start) / max(visible, 1e-9) * rect.width())
+            if rect.left() <= x <= rect.right():
+                painter.setPen(QPen(QColor("#ffffff"), 2))
+                painter.drawLine(x, rect.top(), x, rect.bottom())
+
+
+class WaveformView(QWidget):
+    hit_selected = Signal(int)
+    playback_status = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setMinimumHeight(235)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.duration = 0.0
+        self.position = 0.0
+        self.rows: list[dict] = []
+        self.selected_id: int | None = None
+        self.source_path: Path | None = None
+        self.audio = None
+        self.waveform_points: list[tuple[float, float]] = []
+        self._viewport_seconds = 12.0
+        self._playing = False
+        self._playback_started_at = 0.0
+        self._playback_offset = 0.0
+        self._segment_path: Path | None = None
+        self._pending_start: float | None = None
+        self._preview_worker: PreviewLoadWorker | None = None
+        self._playback_worker: PlaybackSegmentWorker | None = None
+        self._slider_dragging = False
+        self.setToolTip("波形をクリックしてシーク、ヒットマーカーをクリックして詳細を確認")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(5)
+        self.canvas = WaveformCanvas(self)
+        layout.addWidget(self.canvas, 1)
+        controls = QHBoxLayout()
+        self.playback_play_button = QPushButton("再生")
+        self.playback_pause_button = QPushButton("一時停止")
+        self.playback_stop_button = QPushButton("停止")
+        for button, name in (
+            (self.playback_play_button, "元WAVを再生"),
+            (self.playback_pause_button, "元WAVを一時停止"),
+            (self.playback_stop_button, "元WAVを停止"),
+        ):
+            button.setAccessibleName(name)
+            button.setMinimumWidth(64)
+        self.playback_play_button.clicked.connect(self.play_playback)
+        self.playback_pause_button.clicked.connect(self.pause_playback)
+        self.playback_stop_button.clicked.connect(self.stop_playback)
+        controls.addWidget(self.playback_play_button)
+        controls.addWidget(self.playback_pause_button)
+        controls.addWidget(self.playback_stop_button)
+        self.seek_slider = QSlider(Qt.Horizontal)
+        self.seek_slider.setRange(0, 10000)
+        self.seek_slider.setAccessibleName("元WAV再生位置")
+        self.seek_slider.setToolTip("再生位置を変更（波形クリックでもシーク）")
+        self.seek_slider.sliderPressed.connect(self._slider_pressed)
+        self.seek_slider.sliderMoved.connect(self._slider_moved)
+        self.seek_slider.sliderReleased.connect(self._slider_released)
+        controls.addWidget(self.seek_slider, 1)
+        self.playback_time_label = QLabel("00:00.00 / 00:00.00")
+        self.playback_time_label.setMinimumWidth(125)
+        controls.addWidget(self.playback_time_label)
+        layout.addLayout(controls)
+        self.playback_hint_label = QLabel("解析後に表示")
+        self.playback_hint_label.setObjectName("Subtle")
+        layout.addWidget(self.playback_hint_label)
+        self.playback_timer = QTimer(self)
+        self.playback_timer.setInterval(50)
+        self.playback_timer.timeout.connect(self._tick_playback)
+        self.canvas.clicked.connect(self._seek_to)
+        self._update_controls()
+
+    def _view_range(self) -> tuple[float, float]:
+        visible = min(self.duration, self._viewport_seconds) if self.duration > 0 else self._viewport_seconds
+        start = max(0.0, min(self.position - visible / 2.0, max(0.0, self.duration - visible)))
+        return start, max(visible, 0.001)
+
+    def _update_controls(self) -> None:
+        enabled = self.audio is not None and self.duration > 0
+        self.playback_play_button.setEnabled(enabled and not self._playing)
+        self.playback_pause_button.setEnabled(enabled and self._playing)
+        self.playback_stop_button.setEnabled(enabled and (self._playing or self.position > 0))
+        self.seek_slider.setEnabled(enabled)
+        self.playback_time_label.setText(f"{format_seconds(self.position)} / {format_seconds(self.duration)}")
+
+    def _set_position(self, position: float) -> None:
+        self.position = max(0.0, min(float(position), self.duration))
+        self.seek_slider.blockSignals(True)
+        self.seek_slider.setValue(round(self.position / max(self.duration, 1e-9) * 10000))
+        self.seek_slider.blockSignals(False)
+        self._update_controls()
+        self.canvas.update()
+
+    def _slider_pressed(self) -> None:
+        self._slider_dragging = True
+
+    def _slider_moved(self, value: int) -> None:
+        if self.duration > 0:
+            self._set_position(self.duration * value / 10000.0)
+
+    def _slider_released(self) -> None:
+        self._slider_dragging = False
+        self._seek_to(self.duration * self.seek_slider.value() / 10000.0)
+
+    def set_source_path(self, path: str | Path) -> None:
+        self.stop_playback()
+        self.source_path = Path(path).resolve()
+        self.audio = None
+        self.duration = 0.0
+        self.position = 0.0
+        self.rows = []
+        self.selected_id = None
+        self.waveform_points = []
+        self.playback_hint_label.setText("波形を読み込み中…")
+        self._update_controls()
+        self.canvas.update()
+        worker = PreviewLoadWorker(self.source_path, self)
+        worker.loaded.connect(self._source_loaded)
+        worker.failed.connect(self._source_failed)
+        self._preview_worker = worker
+        worker.start()
+
+    def _source_loaded(self, path: str, audio, points) -> None:
+        if self.source_path and Path(path).resolve() != self.source_path:
+            return
+        self.audio = audio
+        self.duration = audio.duration
+        self.waveform_points = list(points)
+        self.playback_hint_label.setText("解析後にオンセット・分類マーカーを表示")
+        self._set_position(0.0)
+        self.canvas.update()
+
+    def _source_failed(self, path: str, message: str) -> None:
+        if self.source_path and Path(path).resolve() != self.source_path:
+            return
+        self.playback_hint_label.setText("WAVを読み込めませんでした")
+        self.playback_status.emit(f"波形読み込みエラー: {message}")
+        self._update_controls()
+        self.canvas.update()
+
+    def set_source_audio(self, path: str | Path, audio) -> None:
+        """Set a preloaded source for offscreen tests and callers with cached audio."""
+        self.stop_playback()
+        self.source_path = Path(path).resolve()
+        self.audio = audio
+        self.duration = audio.duration
+        self.position = 0.0
+        self.waveform_points = _waveform_envelope(audio)
+        self.playback_hint_label.setText("解析後にオンセット・分類マーカーを表示")
+        self._update_controls()
+        self.canvas.update()
+
+    def set_result(self, result: AnalysisResult | None) -> None:
+        if result is None:
+            self.rows, self.selected_id = [], None
+            if self.audio is None:
+                self.duration = 0.0
+            else:
+                self.playback_hint_label.setText("解析後にオンセット・分類マーカーを表示")
+        else:
+            self.duration = self.audio.duration if self.audio is not None else result.duration
+            self.rows = classify_hits(result)
+            self.selected_id = self.rows[0]["id"] if self.rows else None
+            self.playback_hint_label.setText("色と文字で分類を表示 · 波形クリックでシーク")
+        self._set_position(self.position)
+        self.canvas.update()
+
+    def set_selected(self, hit_id: int | None) -> None:
+        self.selected_id = hit_id
+        self.canvas.update()
+
+    def _native_stop(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            import winsound
+
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+    def _cleanup_segment(self) -> None:
+        if self._segment_path:
+            self._segment_path.unlink(missing_ok=True)
+            self._segment_path = None
+
+    def _start_native(self, path: Path, start: float) -> None:
+        if sys.platform != "win32":
+            self.playback_hint_label.setText("この環境では元WAVの再生に対応していません")
+            return
+        try:
+            import winsound
+
+            winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+        except Exception as exc:
+            self.playback_status.emit(f"再生エラー: {exc}")
+            return
+        self._playback_offset = start
+        self._playback_started_at = time.monotonic()
+        self._playing = True
+        self.playback_timer.start()
+        self.playback_hint_label.setText("元WAVを再生中 · クリックまたはスライダーでシーク")
+        self._update_controls()
+
+    def _play_from(self, start: float) -> None:
+        if not self.source_path or self.duration <= 0:
+            return
+        start = max(0.0, min(float(start), self.duration))
+        if start >= self.duration - 0.01:
+            start = 0.0
+        self._native_stop()
+        self._cleanup_segment()
+        if start <= 0.001:
+            self._start_native(self.source_path, 0.0)
+            return
+        self._pending_start = start
+        worker = PlaybackSegmentWorker(self.source_path, start, self)
+        worker.ready.connect(self._segment_ready)
+        worker.failed.connect(lambda message: self.playback_status.emit(f"再生準備エラー: {message}"))
+        self._playback_worker = worker
+        self.playback_hint_label.setText("再生位置を準備中…")
+        worker.start()
+
+    def _segment_ready(self, path: str, start: float) -> None:
+        if self._pending_start is None or abs(self._pending_start - start) > 1e-6:
+            Path(path).unlink(missing_ok=True)
+            return
+        self._pending_start = None
+        self._segment_path = Path(path)
+        self._start_native(self._segment_path, start)
+
+    def play_playback(self) -> None:
+        if self._playing:
+            return
+        self._play_from(self.position)
+
+    def pause_playback(self) -> None:
+        if not self._playing:
+            return
+        self._tick_playback()
+        self._native_stop()
+        self._playing = False
+        self.playback_timer.stop()
+        self._cleanup_segment()
+        self.playback_hint_label.setText("一時停止中 · 再生で続きから再開")
+        self._update_controls()
+
+    def stop_playback(self) -> None:
+        if self._playback_worker and self._playback_worker.isRunning():
+            self._playback_worker.requestInterruption()
+        self._pending_start = None
+        self._native_stop()
+        self._playing = False
+        self.playback_timer.stop()
+        self._cleanup_segment()
+        self._set_position(0.0)
+        if self.audio is not None:
+            self.playback_hint_label.setText("解析後にオンセット・分類マーカーを表示")
+        self._update_controls()
+
+    def _tick_playback(self) -> None:
+        if not self._playing:
+            return
+        current = self._playback_offset + time.monotonic() - self._playback_started_at
+        if current >= self.duration:
+            self._native_stop()
+            self._playing = False
+            self.playback_timer.stop()
+            self._cleanup_segment()
+            self._set_position(self.duration)
+            self.playback_hint_label.setText("再生完了")
+            return
+        self._set_position(current)
+
+    def _seek_to(self, position: float) -> None:
+        if self.duration <= 0:
+            return
+        self._set_position(position)
+        if self._playing:
+            self._playing = False
+            self.playback_timer.stop()
+            self._play_from(self.position)
+
+    def shutdown(self) -> None:
+        self.stop_playback()
+        if self._preview_worker and self._preview_worker.isRunning():
+            self._preview_worker.requestInterruption()
+            self._preview_worker.wait(3000)
+        if self._playback_worker and self._playback_worker.isRunning():
+            self._playback_worker.requestInterruption()
+            self._playback_worker.wait(3000)
 
 
 class MetricCard(QFrame):
@@ -699,6 +1105,7 @@ class MainWindow(QMainWindow):
         self.waveform = WaveformView()
         self.waveform.setObjectName("Panel")
         self.waveform.hit_selected.connect(self._select_hit)
+        self.waveform.playback_status.connect(self._log)
         right_layout.addWidget(self.waveform)
 
         metrics = QGridLayout()
@@ -853,6 +1260,13 @@ class MainWindow(QMainWindow):
         self.input_edit.setText(str(path))
         self.drop_zone.title.setText(path.name)
         self.drop_zone.hint.setText("PCM WAV準備完了 · Ctrl+Enterで解析")
+        self.result = None
+        self.rows = []
+        self.waveform.set_source_path(path)
+        if hasattr(self, "hit_table"):
+            self.hit_table.setRowCount(0)
+        if hasattr(self, "sample_list"):
+            self.sample_list.clear()
         self.json_edit.setText(str(path.with_suffix(".bra.json")))
         self.samples_edit.setText(str(path.parent / f"{path.stem}_keysounds"))
         self.csv_edit.setText(str(path.with_suffix(".csv")))
@@ -1262,6 +1676,7 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def closeEvent(self, event) -> None:
+        self.waveform.shutdown()
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait(3000)

@@ -112,7 +112,11 @@ def write_hit_wavs(
     output_dir.mkdir(parents=True, exist_ok=True)
     hit_by_id = {hit.id: hit for hit in hits}
     paths: list[Path] = []
+    written_cluster_ids: set[int] = set()
     for cluster in plan.clusters:
+        if cluster.id in written_cluster_ids:
+            raise ValueError(f"duplicate reuse-plan cluster id: {cluster.id}")
+        written_cluster_ids.add(cluster.id)
         hit = hit_by_id[cluster.representative_hit]
         # Use the extracted source boundary.  Reading a full window from the
         # raw stem would re-introduce the next hit that extraction excluded.
@@ -134,4 +138,6 @@ def write_hit_wavs(
         path = output_dir / f"sample_{cluster.id:03d}.wav"
         write_wav(path, values, audio.sample_rate, audio.channels, sample_width=audio.sample_width)
         paths.append(path)
+    if len(paths) != len(plan.clusters):
+        raise RuntimeError("representative WAV count does not match reuse-plan clusters")
     return paths
