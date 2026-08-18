@@ -137,6 +137,32 @@ class PerformanceSmokeTest(unittest.TestCase):
             f"fast={fast_elapsed:.4f}s/{len(fast_reports)} comparisons"
         )
 
+    def test_fast_mode_526_hit_benchmark_reduces_compare_stage(self):
+        hits = [_feature_hit(index, float(index % 10) * 100.0) for index in range(526)]
+
+        def compare(reference, candidate):
+            # Keep a small deterministic workload so the benchmark measures
+            # stage wall time, not only the number of candidate reports.
+            sum(index * index for index in range(5000))
+            classification = "SAME" if reference.id % 10 == candidate.id % 10 else "DIFFERENT"
+            return _report(reference, candidate, classification)
+
+        normal_started = time.perf_counter()
+        normal_plan, normal_reports = build_reuse_plan(hits, compare)
+        normal_elapsed = time.perf_counter() - normal_started
+        fast_started = time.perf_counter()
+        fast_plan, fast_reports = build_reuse_plan(hits, compare, fast_compare=True)
+        fast_elapsed = time.perf_counter() - fast_started
+
+        self.assertEqual(len(normal_plan.clusters), 10)
+        self.assertEqual(len(fast_plan.clusters), 10)
+        self.assertLess(len(fast_reports), len(normal_reports))
+        self.assertLess(fast_elapsed, normal_elapsed)
+        print(
+            f"526-hit compare benchmark: normal={normal_elapsed:.3f}s/{len(normal_reports)} comparisons, "
+            f"fast={fast_elapsed:.3f}s/{len(fast_reports)} comparisons"
+        )
+
     def test_fast_mode_adversarial_two_clusters_can_change_first_match(self):
         hits = [_feature_hit(0, 0.0), _feature_hit(1, 100.0), _feature_hit(2, 100.0), _feature_hit(3, 50.0)]
 
