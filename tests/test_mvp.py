@@ -1,12 +1,15 @@
 import math
 import json
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from bms_reuse.classification.classifier import classify_report
 from bms_reuse.application import AnalysisCancelled, analyze_file
 from bms_reuse.audio.loader import load_audio, mono_signal
+from bms_reuse.cli import main as cli_main
 from bms_reuse.detection.onset import Onset, detect_onsets
 from bms_reuse.extraction.hit_extractor import Hit, extract_hits
 from bms_reuse.export.json_exporter import write_json
@@ -114,6 +117,17 @@ class BoundaryTest(unittest.TestCase):
             self.assertEqual(updates[-1], (3, 3))
             with self.assertRaises(AnalysisCancelled):
                 extract_hits(audio, onsets, window_ms=20, is_cancelled=lambda: True)
+
+    def test_cli_fast_compare_flag_is_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "cli-fast.wav"
+            output = Path(directory) / "cli-fast.json"
+            write_wav(source, [], 1000)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(cli_main(["analyze", str(source), "--output", str(output), "--fast-compare"]), 0)
+            data = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(data["settings"]["compare_mode"], "fast")
+            self.assertTrue(data["settings"]["fast_compare"])
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -43,6 +43,9 @@ class AnalysisResult:
             "overlap": counts.get("OVERLAP", 0),
             "required_samples": self.plan.required_samples,
             "reuse_ratio": round((1.0 - self.plan.required_samples / len(self.hits)) * 100.0, 2) if self.hits else 0.0,
+            "comparisons": len(self.comparisons),
+            "comparison_cache_hits": int(self.settings.get("comparison_cache_hits", 0)),
+            "compare_mode": self.settings.get("compare_mode", "normal"),
             "timings": dict(self.settings.get("timings", {})),
         }
 
@@ -62,6 +65,31 @@ class AnalysisResult:
 
 class AnalysisCancelled(Exception):
     """Raised when an optional GUI cancellation request is observed."""
+
+
+def _sample_fingerprint(samples) -> tuple[tuple[int, ...], str, bytes]:
+    """Build an internal shape/dtype/bytes fingerprint without changing JSON."""
+    shape_value = getattr(samples, "shape", None)
+    shape = tuple(int(value) for value in shape_value) if shape_value is not None else (len(samples),)
+    dtype = str(getattr(samples, "dtype", "python"))
+    if hasattr(samples, "tobytes"):
+        raw = samples.tobytes()
+    else:
+        raw = repr(tuple(float(value) for value in samples)).encode("utf-8")
+    return shape, dtype, hashlib.sha256(raw).digest()
+
+
+def _samples_equal(left, right) -> bool:
+    """Verify a digest match using the exact sample representation."""
+    left_shape_value = getattr(left, "shape", None)
+    right_shape_value = getattr(right, "shape", None)
+    left_shape = tuple(int(value) for value in left_shape_value) if left_shape_value is not None else (len(left),)
+    right_shape = tuple(int(value) for value in right_shape_value) if right_shape_value is not None else (len(right),)
+    if left_shape != right_shape or str(getattr(left, "dtype", "python")) != str(getattr(right, "dtype", "python")):
+        return False
+    if hasattr(left, "tobytes") and hasattr(right, "tobytes"):
+        return left.tobytes() == right.tobytes()
+    return list(left) == list(right)
 
 
 def record_output_timing(result: AnalysisResult, output_seconds: float) -> None:
@@ -102,6 +130,7 @@ def analyze_file(
     margin: float | None = None,
     fade_in_ms: float = 0.0,
     fade_out_ms: float = 0.0,
+    fast_compare: bool = False,
 ) -> AnalysisResult:
     analysis_started = time.perf_counter()
 
@@ -184,8 +213,26 @@ def analyze_file(
             report(30 + round((index + 1) / len(hits) * 20), f"Extracting features {index + 1}/{len(hits)}")
     timings["feature_seconds"] = round(time.perf_counter() - stage_started, 6)
 
+    fingerprints = {hit.id: _sample_fingerprint(hit.samples) for hit in hits}
+    exact_report_cache: dict[tuple[tuple[int, ...], str, bytes, bool], list[tuple[object, SimilarityReport]]] = {}
+    cache_stats = {"hits": 0, "entries": 0}
+
     def compare(reference, candidate):
-        return compare_hits(reference, candidate, audio.sample_rate, max_alignment_ms=max_alignment_ms)
+        reference_fingerprint = fingerprints[reference.id]
+        candidate_fingerprint = fingerprints[candidate.id]
+        overlap = bool(getattr(reference, "overlap_warning", False) or getattr(candidate, "overlap_warning", False))
+        if reference_fingerprint == candidate_fingerprint:
+            key = reference_fingerprint + (overlap,)
+            for cached_samples, cached_report in exact_report_cache.get(key, []):
+                if _samples_equal(cached_samples, candidate.samples) and _samples_equal(cached_samples, reference.samples):
+                    cache_stats["hits"] += 1
+                    return replace(cached_report, reference_id=reference.id, candidate_id=candidate.id)
+        report = compare_hits(reference, candidate, audio.sample_rate, max_alignment_ms=max_alignment_ms)
+        if reference_fingerprint == candidate_fingerprint:
+            key = reference_fingerprint + (overlap,)
+            exact_report_cache.setdefault(key, []).append((reference.samples, replace(report)))
+            cache_stats["entries"] += 1
+        return report
 
     report(52, "Comparing and clustering hits")
     stage_started = time.perf_counter()
@@ -197,7 +244,7 @@ def analyze_file(
             last_compare_report[0] = now
             report(
                 52 + round(current / max(1, total) * 43),
-                f"Comparing and clustering hits {current}/{total} ({compared} comparisons)",
+                f"Comparing and clustering hits {current}/{total} ({compared} comparisons, {cache_stats['hits']} cache hits)",
             )
 
     plan, comparisons = build_reuse_plan(
@@ -208,6 +255,10 @@ def analyze_file(
         progress=lambda done, total: report(52 + round(done / max(1, total) * 43), f"Comparing and clustering hits {done}/{total}"),
         progress_detail=report_compare_detail,
         is_cancelled=is_cancelled,
+        fast_compare=fast_compare,
+        reuse_key=lambda hit: fingerprints[hit.id] + (bool(getattr(hit, "overlap_warning", False)),),
+        reuse_equal=lambda left, right: _samples_equal(left.samples, right.samples) and bool(getattr(left, "overlap_warning", False)) == bool(getattr(right, "overlap_warning", False)),
+        cache_hit=lambda: cache_stats.__setitem__("hits", cache_stats["hits"] + 1),
     )
     timings["compare_seconds"] = round(time.perf_counter() - stage_started, 6)
     timings["analysis_seconds"] = round(time.perf_counter() - analysis_started, 6)
@@ -233,6 +284,11 @@ def analyze_file(
         "subdivision": subdivision,
         "fade_in_ms": fade_in_ms,
         "fade_out_ms": fade_out_ms,
+        "compare_mode": "fast" if fast_compare else "normal",
+        "fast_compare": bool(fast_compare),
+        "comparison_count": len(comparisons),
+        "comparison_cache_hits": cache_stats["hits"],
+        "comparison_cache_entries": cache_stats["entries"],
         "timings": timings,
     }
     report(100, "Analysis complete")

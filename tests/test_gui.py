@@ -53,6 +53,7 @@ class GuiSupportTest(unittest.TestCase):
         self.assertEqual(window.margin_spin.value(), 90.0)
         self.assertEqual(window.fade_in_spin.value(), 2.0)
         self.assertEqual(window.fade_out_spin.value(), 2.0)
+        self.assertFalse(window.fast_compare_check.isChecked())
         self.assertEqual(window.filter_combo.itemData(2), "SAME")
         self.assertEqual(CLASS_LABELS["SAME"], "同一")
         self.assertEqual(CLASS_LABELS["GAIN_VARIANT"], "音量違い")
@@ -63,8 +64,8 @@ class GuiSupportTest(unittest.TestCase):
         self.assertEqual(localize_progress("Extracting 12 hits"), "12個のヒットを切り出し中")
         self.assertEqual(localize_progress("Extracting hits 3/12"), "ヒットを切り出し中 3/12")
         self.assertEqual(
-            localize_progress("Comparing and clustering hits 3/12 (8 comparisons)"),
-            "比較・クラスタリング中 3/12 (8件比較)",
+            localize_progress("Comparing and clustering hits 3/12 (8 comparisons, 2 cache hits)"),
+            "比較・クラスタリング中 3/12 (8件比較, 2件キャッシュ再利用)",
         )
         visible_text = " ".join(
             [
@@ -118,6 +119,8 @@ class GuiSupportTest(unittest.TestCase):
             window.margin_spin.setValue(80.0)
             expected = (60.0 / 174.0) / 4.0 * 0.80
             self.assertAlmostEqual(window._settings()["min_interval_sec"], expected)
+            window.fast_compare_check.setChecked(True)
+            self.assertTrue(window._settings()["fast_compare"])
             window.bpm_spin.setValue(19.0)
             self.assertFalse(window.analyze_button.isEnabled())
             self.assertIn("20", window.bpm_error_label.text())
@@ -146,6 +149,8 @@ class GuiSupportTest(unittest.TestCase):
             self.assertAlmostEqual(settings["min_interval_sec"], 0.05)
             self.assertEqual(settings["fade_in_ms"], 2.0)
             self.assertEqual(settings["fade_out_ms"], 3.0)
+            self.assertEqual(settings["compare_mode"], "normal")
+            self.assertFalse(settings["fast_compare"])
 
             audio = load_audio(write_wav(Path(directory) / "tone.wav", [[1.0]] * 10, 1000))
             hit = Hit(1, 0, 0.0, audio.samples, 0, 10)

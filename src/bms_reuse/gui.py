@@ -113,7 +113,7 @@ def localize_progress(message: str) -> str:
     if message == "Comparing and clustering hits":
         return "比較・クラスタリング中"
     if message.startswith("Comparing and clustering hits "):
-        detail = message[30:].replace(" comparisons", "件比較")
+        detail = message[30:].replace(" comparisons", "件比較").replace(" cache hits", "件キャッシュ再利用")
         return f"比較・クラスタリング中 {detail}"
     if message == "Writing analysis JSON":
         return "解析JSONを書き出し中"
@@ -616,6 +616,9 @@ class MainWindow(QMainWindow):
         self.subdivision_spin = QSpinBox()
         self.subdivision_spin.setRange(1, 128)
         self.subdivision_spin.setValue(16)
+        self.fast_compare_check = QCheckBox("高速比較（代表順が変わる場合があります）")
+        self.fast_compare_check.setAccessibleName("高速比較（代表順が変わる場合があります）")
+        self.fast_compare_check.setToolTip("特徴量に近い代表から比較します。結果の代表順が変わる可能性があります。")
         add_setting_row("楽器", self.instrument_combo)
         add_setting_row("同一判定しきい値", self.threshold_spin)
         add_setting_row("スペクトルしきい値", self.spectral_spin)
@@ -631,6 +634,7 @@ class MainWindow(QMainWindow):
         add_setting_row("グリッドオフセット", self.offset_spin)
         add_setting_row("分割数", self.subdivision_spin)
         add_setting_row("最大アライメント", self.alignment_spin)
+        add_setting_row("比較モード", self.fast_compare_check)
         left_layout.addWidget(settings_box)
 
         output_box = QGroupBox("出力")
@@ -931,6 +935,7 @@ class MainWindow(QMainWindow):
             "fade_out_ms": self.fade_out_spin.value(),
             "offset": self.offset_spin.value(),
             "subdivision": self.subdivision_spin.value(),
+            "fast_compare": self.fast_compare_check.isChecked(),
         }
 
     def _outputs(self) -> dict:
@@ -1061,6 +1066,11 @@ class MainWindow(QMainWindow):
         self._log(
             f"解析完了: ヒット{summary['detected_hits']}件 · 必要サンプル{summary['required_samples']}個 · "
             f"再利用率{summary['reuse_ratio']:.1f}%"
+        )
+        mode_label = "高速" if summary.get("compare_mode") == "fast" else "通常"
+        self._log(
+            f"比較: {summary.get('comparisons', len(result.comparisons))}件 · "
+            f"キャッシュ再利用: {summary.get('comparison_cache_hits', 0)}件 · モード: {mode_label}"
         )
         timings = summary.get("timings", {})
         if timings:

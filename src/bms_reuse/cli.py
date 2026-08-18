@@ -38,6 +38,7 @@ def _parser() -> argparse.ArgumentParser:
     analyze.add_argument("--bpm", type=float)
     analyze.add_argument("--offset", type=float, default=0.0)
     analyze.add_argument("--subdivision", type=int, default=16)
+    analyze.add_argument("--fast-compare", action="store_true", help="rank representatives by shape features (ordering may change)")
     analyze.add_argument("--full-json", action="store_true", help="print the complete JSON result")
     return parser
 
@@ -65,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
             bpm=args.bpm,
             offset=args.offset,
             subdivision=args.subdivision,
+            fast_compare=args.fast_compare,
         )
         output_started = time.perf_counter()
         data = result.to_dict()

@@ -39,3 +39,6 @@ PySide6はQt for PythonのLGPLv3/GPLv3または商用ライセンスの対象で
 dist\bms-reuse.exe analyze kick_stem.wav `
   --output project.bra.json --export-dir keysounds --csv events.csv
 ```
+
+比較順を特徴量の近い代表から始める明示的な高速モードは
+`--fast-compare` で有効化できます。代表順と判定結果が変わる可能性があるため、指定しない場合は通常モードです。

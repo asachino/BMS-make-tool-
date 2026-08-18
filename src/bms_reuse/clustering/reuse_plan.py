@@ -2,11 +2,40 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable
 
 from ..classification.classifier import classify_report
 from ..similarity.score import SimilarityReport
+
+
+_FEATURE_KEYS = ("centroid_hz", "rolloff_hz", "zcr", "attack_ms")
+
+
+def _gain_invariant_features(features: dict) -> tuple[float, ...] | None:
+    """Return shape-oriented features without using absolute level."""
+    if not features or any(key not in features for key in _FEATURE_KEYS):
+        return None
+    try:
+        rms_db = float(features.get("rms_db", -120.0))
+        rms_amplitude = max(1e-6, 10.0 ** (rms_db / 20.0))
+        tail_ratio = float(features.get("tail_energy", 0.0)) / rms_amplitude
+        values = tuple(float(features[key]) for key in _FEATURE_KEYS) + (tail_ratio,)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return values if all(value == value and abs(value) != float("inf") for value in values) else None
+
+
+def _feature_distance(left, right) -> float:
+    """Rank representatives by a scale-normalized, gain-invariant distance."""
+    left_values = _gain_invariant_features(getattr(left, "features", {}))
+    right_values = _gain_invariant_features(getattr(right, "features", {}))
+    if left_values is None or right_values is None:
+        return float("inf")
+    return sum(
+        ((left_value - right_value) / max(1.0, abs(left_value), abs(right_value))) ** 2
+        for left_value, right_value in zip(left_values, right_values)
+    )
 
 
 @dataclass
@@ -64,6 +93,10 @@ def build_reuse_plan(
     progress: Callable[[int, int], None] | None = None,
     progress_detail: Callable[[int, int, int], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    fast_compare: bool = False,
+    reuse_key: Callable[[object], object] | None = None,
+    reuse_equal: Callable[[object, object], bool] | None = None,
+    cache_hit: Callable[[], None] | None = None,
 ) -> tuple[ReusePlan, list[SimilarityReport]]:
     """Group hits against existing representatives; return plan and comparisons.
 
@@ -76,6 +109,36 @@ def build_reuse_plan(
     assignments: dict[int, tuple[int, float]] = {}
     reports: list[SimilarityReport] = []
     comparison_cache: dict[tuple[int, int], SimilarityReport] = {}
+    reuse_cache: dict[object, list[dict]] = {}
+
+    def find_reuse_entry(hit):
+        if reuse_key is None:
+            return None
+        key = reuse_key(hit)
+        if key is None:
+            return None
+        for entry in reuse_cache.get(key, []):
+            if reuse_equal is None or reuse_equal(entry["hit"], hit):
+                return entry
+        return None
+
+    def save_reuse_entry(hit, cluster: Cluster, hit_reports: list[SimilarityReport], gain_db: float) -> None:
+        if reuse_key is None:
+            return
+        key = reuse_key(hit)
+        if key is None:
+            return
+        entry = {
+            "hit": hit,
+            "cluster_id": cluster.id,
+            "gain_db": gain_db,
+            "reports": [replace(report) for report in hit_reports],
+            # A newly-created representative was not compared with itself.
+            # The first duplicate performs that one required comparison, then
+            # subsequent duplicates can reuse the complete sequence.
+            "needs_self": cluster.representative_hit == hit.id,
+        }
+        reuse_cache.setdefault(key, []).append(entry)
     # ponytail: sequential representative scan; add indexed clustering if
     # large stems make O(hits × clusters) measurable.
     if callable(compare):
@@ -85,9 +148,52 @@ def build_reuse_plan(
                 from ..application import AnalysisCancelled
 
                 raise AnalysisCancelled()
+
+            reuse_entry = find_reuse_entry(hit)
+            if reuse_entry is not None:
+                cluster = clusters[reuse_entry["cluster_id"] - 1]
+                reused_reports = [replace(report, candidate_id=hit.id) for report in reuse_entry["reports"]]
+                compared = len(reused_reports)
+                if reuse_entry["needs_self"]:
+                    if is_cancelled and is_cancelled():
+                        from ..application import AnalysisCancelled
+
+                        raise AnalysisCancelled()
+                    self_report = classify_report(
+                        compare(by_id[cluster.representative_hit], hit),
+                        threshold=threshold,
+                        spectral_threshold=spectral_threshold,
+                    )
+                    if self_report.classification not in {"SAME", "GAIN_VARIANT"}:
+                        reuse_entry = None
+                    else:
+                        reused_reports.append(self_report)
+                        compared += 1
+                        reuse_entry["reports"] = [replace(report) for report in reused_reports]
+                        reuse_entry["needs_self"] = False
+                if reuse_entry is not None:
+                    reports.extend(reused_reports)
+                    cluster.hit_ids.append(hit.id)
+                    assignments[hit.id] = (cluster.id, reuse_entry["gain_db"])
+                    if cache_hit:
+                        cache_hit()
+                    if progress_detail:
+                        for compared_index in range(1, compared + 1):
+                            progress_detail(index + 1, total, compared_index)
+                    if progress:
+                        progress(index + 1, total)
+                    continue
+
             assigned = False
             compared = 0
-            for cluster in clusters:
+            hit_reports: list[SimilarityReport] = []
+            candidate_clusters = clusters
+            if fast_compare:
+                candidate_clusters = sorted(
+                    clusters,
+                    key=lambda cluster: (_feature_distance(by_id[cluster.representative_hit], hit), cluster.id),
+                )
+            for cluster in candidate_clusters:
                 if is_cancelled and is_cancelled():
                     from ..application import AnalysisCancelled
 
@@ -99,6 +205,7 @@ def build_reuse_plan(
                     comparison_cache[key] = report
                 report = classify_report(report, threshold=threshold, spectral_threshold=spectral_threshold)
                 reports.append(report)
+                hit_reports.append(report)
                 compared += 1
                 if progress_detail:
                     progress_detail(index + 1, total, compared)
@@ -111,6 +218,7 @@ def build_reuse_plan(
                 cluster = Cluster(len(clusters) + 1, hit.id, [hit.id])
                 clusters.append(cluster)
                 assignments[hit.id] = (cluster.id, 0.0)
+            save_reuse_entry(hit, cluster, hit_reports, assignments[hit.id][1])
             if progress:
                 progress(index + 1, total)
     else:
