@@ -142,9 +142,10 @@ def localize_progress(message: str) -> str:
 DARK_STYLE = """
 QMainWindow, QWidget { background: #101317; color: #f5f7fb; font-family: "Yu Gothic UI", "Meiryo UI", "Segoe UI"; font-size: 10pt; }
 QLabel, QCheckBox { background: transparent; }
-QFrame#Panel { background: #1b1f26; border: 1px solid #303640; border-radius: 8px; }
-QGroupBox { background: transparent; border: 1px solid #303640; border-radius: 8px; }
-QFrame#DropZone { border: 1px dashed #66707f; background: #1c222b; border-radius: 8px; }
+QFrame#Panel { background: #1b1f26; border: 1px solid #303640; border-radius: 6px; }
+QFrame#SettingsColumn { background: transparent; border: none; }
+QGroupBox { background: transparent; border: 1px solid #303640; border-radius: 5px; }
+QFrame#DropZone { border: 1px dashed #66707f; background: #1c222b; border-radius: 5px; }
 QFrame#DropZone[dragActive="true"] { background: #242a33; border: 1px solid #8a95a5; }
 QWidget#WaveformView { background: transparent; border: none; }
 QLabel#Brand { color: #dce2ea; font-size: 17pt; font-weight: 700; letter-spacing: 1px; }
@@ -156,9 +157,9 @@ QLabel#MetricCaption { color: #9aa4b2; font-size: 8pt; font-weight: 600; text-tr
 QLabel#DropTitle { color: #e8edf3; font-size: 12pt; font-weight: 700; }
 QLabel#DropHint { color: #a9b1bd; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background: #1b1f26; border: 1px solid #35404e; border-radius: 6px; padding: 7px 9px; color: #f5f7fb; min-height: 20px; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 2px solid #007aff; padding: 6px 8px; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #007aff; padding: 7px 9px; }
 QComboBox QAbstractItemView { background: #1b1f26; color: #f5f7fb; selection-background-color: #343c47; }
-QPushButton { background: #242a33; color: #e9edf4; border: 1px solid #35404e; border-radius: 7px; padding: 8px 14px; min-height: 20px; }
+QPushButton { background: #242a33; color: #e9edf4; border: 1px solid #35404e; border-radius: 5px; padding: 8px 14px; min-height: 20px; }
 QPushButton:hover { background: #2d3541; border-color: #59687d; }
 QPushButton:pressed { background: #374354; }
 QPushButton:disabled { color: #66707f; background: #1b1f26; }
@@ -171,12 +172,12 @@ QCheckBox:hover { color: #ffffff; }
 QCheckBox:pressed { color: #d7dce5; }
 QGroupBox { margin-top: 10px; padding: 16px 12px 12px 12px; font-weight: 700; color: #c4cad3; }
 QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; }
-QTableWidget { background: #1b1f26; alternate-background-color: #20252d; border: 1px solid #303640; border-radius: 8px; gridline-color: #2a3039; selection-background-color: #343c47; selection-color: #ffffff; }
+QTableWidget { background: #1b1f26; alternate-background-color: #20252d; border: 1px solid #303640; border-radius: 5px; gridline-color: #2a3039; selection-background-color: #343c47; selection-color: #ffffff; }
 QHeaderView::section { background: #242a33; color: #c4cad3; border: none; border-right: 1px solid #303640; border-bottom: 1px solid #303640; padding: 8px; font-weight: 700; }
-QListWidget { background: #1b1f26; border: 1px solid #303640; border-radius: 7px; }
+QListWidget { background: #1b1f26; border: 1px solid #303640; border-radius: 5px; }
 QListWidget::item { padding: 6px; }
 QListWidget::item:selected { background: #343c47; }
-QPlainTextEdit { background: #1b1f26; border: 1px solid #303640; border-radius: 7px; color: #9aa4b2; font-family: "Cascadia Mono", Consolas; font-size: 9pt; }
+QPlainTextEdit { background: #1b1f26; border: 1px solid #303640; border-radius: 5px; color: #9aa4b2; font-family: "Cascadia Mono", Consolas; font-size: 9pt; }
 QProgressBar { background: #1b1f26; border: 1px solid #35404e; border-radius: 4px; text-align: center; color: #d7dce5; height: 12px; }
 QProgressBar::chunk { background: #007aff; border-radius: 3px; }
 QStatusBar { background: #111419; color: #9aa4b2; }
@@ -187,9 +188,10 @@ QToolTip { background: #222a35; color: #ffffff; border: 1px solid #4b5768; paddi
 LIGHT_STYLE = """
 QMainWindow, QWidget { background: #f3f5f8; color: #1c2430; font-family: "Yu Gothic UI", "Meiryo UI", "Segoe UI"; font-size: 10pt; }
 QLabel, QCheckBox { background: transparent; }
-QFrame#Panel { background: #ffffff; border: 1px solid #dfe4eb; border-radius: 8px; }
-QGroupBox { background: transparent; border: 1px solid #dfe4eb; border-radius: 8px; }
-QFrame#DropZone { border: 1px dashed #aab7c7; background: #f8fafc; border-radius: 8px; }
+QFrame#Panel { background: #ffffff; border: 1px solid #dfe4eb; border-radius: 6px; }
+QFrame#SettingsColumn { background: transparent; border: none; }
+QGroupBox { background: transparent; border: 1px solid #dfe4eb; border-radius: 5px; }
+QFrame#DropZone { border: 1px dashed #aab7c7; background: #f8fafc; border-radius: 5px; }
 QFrame#DropZone[dragActive="true"] { background: #eef2f6; border: 1px solid #8d9aaa; }
 QWidget#WaveformView { background: transparent; border: none; }
 QLabel#Brand { color: #344054; font-size: 17pt; font-weight: 700; letter-spacing: 1px; }
@@ -201,9 +203,9 @@ QLabel#MetricCaption { color: #667085; font-size: 8pt; font-weight: 600; text-tr
 QLabel#DropTitle { color: #344054; font-size: 12pt; font-weight: 700; }
 QLabel#DropHint { color: #667085; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 7px 9px; color: #1c2430; min-height: 20px; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 2px solid #007aff; padding: 6px 8px; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #007aff; padding: 7px 9px; }
 QComboBox QAbstractItemView { background: #ffffff; color: #1c2430; selection-background-color: #e8edf3; }
-QPushButton { background: #ffffff; color: #1c2430; border: 1px solid #d7dee8; border-radius: 7px; padding: 8px 14px; min-height: 20px; }
+QPushButton { background: #ffffff; color: #1c2430; border: 1px solid #d7dee8; border-radius: 5px; padding: 8px 14px; min-height: 20px; }
 QPushButton:hover { background: #f4f6f8; border-color: #b8c2cf; }
 QPushButton:pressed { background: #e8edf3; }
 QPushButton:disabled { color: #a0a8b4; background: #f3f5f8; }
@@ -216,12 +218,12 @@ QCheckBox:hover { color: #102033; }
 QCheckBox:pressed { color: #475467; }
 QGroupBox { margin-top: 10px; padding: 16px 12px 12px 12px; font-weight: 700; color: #475467; }
 QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; }
-QTableWidget { background: #ffffff; alternate-background-color: #f7f9fc; border: 1px solid #dfe4eb; border-radius: 8px; gridline-color: #e8edf3; selection-background-color: #e6edf5; selection-color: #102033; }
+QTableWidget { background: #ffffff; alternate-background-color: #f7f9fc; border: 1px solid #dfe4eb; border-radius: 5px; gridline-color: #e8edf3; selection-background-color: #e6edf5; selection-color: #102033; }
 QHeaderView::section { background: #f3f5f8; color: #475467; border: none; border-right: 1px solid #dfe4eb; border-bottom: 1px solid #dfe4eb; padding: 8px; font-weight: 700; }
-QListWidget { background: #ffffff; border: 1px solid #dfe4eb; border-radius: 7px; }
+QListWidget { background: #ffffff; border: 1px solid #dfe4eb; border-radius: 5px; }
 QListWidget::item { padding: 6px; }
 QListWidget::item:selected { background: #e6edf5; }
-QPlainTextEdit { background: #ffffff; border: 1px solid #dfe4eb; border-radius: 7px; color: #667085; font-family: "Cascadia Mono", Consolas; font-size: 9pt; }
+QPlainTextEdit { background: #ffffff; border: 1px solid #dfe4eb; border-radius: 5px; color: #667085; font-family: "Cascadia Mono", Consolas; font-size: 9pt; }
 QProgressBar { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 4px; text-align: center; color: #344054; height: 12px; }
 QProgressBar::chunk { background: #007aff; border-radius: 3px; }
 QStatusBar { background: #f8fafc; color: #667085; }
@@ -608,14 +610,17 @@ class WaveformCanvas(QWidget):
             x = rect.left() + round(rect.width() * fraction)
             painter.drawLine(x, rect.top(), x, rect.bottom())
             painter.setPen(QColor("#4f555a"))
-            painter.drawText(x + 3, self.height() - 8, format_seconds(start + visible * fraction))
+            time_label = format_seconds(start + visible * fraction)
+            label_x = min(x + 3, rect.right() - painter.fontMetrics().horizontalAdvance(time_label))
+            painter.drawText(label_x, self.height() - 8, time_label)
             painter.setPen(QPen(QColor("#9da1a4"), 1))
 
         # Thin musical grid lines sit behind the real source waveform.
         if owner.bpm and owner.bpm > 0:
             beat_step = 60.0 / owner.bpm / max(1, owner.subdivision)
             grid_step = beat_step
-            while visible / max(grid_step, 1e-9) > max(200, rect.width() * 2):
+            grid_limit = max(64, rect.width() // 8)
+            while visible / max(grid_step, 1e-9) > grid_limit:
                 grid_step *= 2.0
             grid_time = owner.offset + max(0, int((start - owner.offset) / grid_step) - 1) * grid_step
             while grid_time <= end + grid_step:
@@ -628,7 +633,7 @@ class WaveformCanvas(QWidget):
                     elif beat_index % owner.subdivision == 0:
                         color, width, label = QColor("#8f9599"), 1, "拍"
                     else:
-                        color, width, label = QColor("#a5a9ac"), 1, ""
+                        color, width, label = QColor("#aeb1b3"), 1, ""
                     painter.setPen(QPen(color, width))
                     painter.drawLine(x, rect.top(), x, rect.bottom())
                     if label:
@@ -650,6 +655,10 @@ class WaveformCanvas(QWidget):
         for channel_rect in channel_rects:
             center = channel_rect.center().y()
             painter.drawLine(channel_rect.left(), center, channel_rect.right(), center)
+        if stereo:
+            boundary_y = (channel_rects[0].bottom() + channel_rects[1].top()) // 2
+            painter.setPen(QPen(QColor("#7f8589"), 1))
+            painter.drawLine(rect.left(), boundary_y, rect.right(), boundary_y)
 
         if points:
             painter.setPen(QPen(QColor("#20262b"), 1))
@@ -684,7 +693,10 @@ class WaveformCanvas(QWidget):
             nearest = min(owner.rows, key=lambda row: abs(float(row["time"]) - owner.position))
             if abs(float(nearest["time"]) - owner.position) <= max(0.04, visible / max(1, len(owner.rows) * 2)):
                 nearest_id = nearest["id"]
-        for marker_index, row in enumerate(owner.rows):
+        label_gap = max(72, min(132, rect.width() // 9))
+        last_label_x = rect.left() - label_gap
+        labels_enabled = owner.marker_labels_check.isChecked()
+        for row in owner.rows:
             marker_time = float(row["time"])
             if marker_time < start or marker_time > end:
                 continue
@@ -693,9 +705,19 @@ class WaveformCanvas(QWidget):
             color = QColor(CLASS_COLORS.get(row["classification"], "#94a3b8"))
             painter.setPen(QPen(color, 3 if selected else 1))
             painter.drawLine(x, rect.top(), x, rect.bottom())
-            label = f"C{row.get('cluster_id') or '?'} {CLASS_LABELS.get(row['classification'], row['classification'])}"
-            painter.setPen(color)
-            painter.drawText(x + 3, rect.top() + 15 + (marker_index % 3) * 15, label)
+            if labels_enabled and x - last_label_x >= label_gap:
+                label = f"C{row.get('cluster_id') or '?'} {CLASS_LABELS.get(row['classification'], row['classification'])}"
+                label_width = painter.fontMetrics().horizontalAdvance(label) + 8
+                label_rect = QRect(x + 2, rect.top() + 20, label_width, 17)
+                if label_rect.right() > rect.right():
+                    label_rect.moveRight(rect.right())
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor("#b7b9bb"))
+                painter.drawRect(label_rect)
+                painter.setPen(color)
+                painter.drawText(label_rect.left() + 4, label_rect.bottom() - 4, label)
+                painter.setBrush(Qt.NoBrush)
+                last_label_x = x
             if selected:
                 painter.setBrush(color)
                 painter.drawEllipse(QPoint(x, rect.top() - 1), 3, 3)
@@ -714,8 +736,8 @@ class WaveformView(QWidget):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setMinimumHeight(235)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.setMinimumHeight(300)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.duration = 0.0
         self.sample_rate = 0
         self.bpm: float | None = None
@@ -744,6 +766,7 @@ class WaveformView(QWidget):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(5)
         self.canvas = WaveformCanvas(self)
+        self.canvas.setMinimumHeight(220)
         layout.addWidget(self.canvas, 1)
         controls = QHBoxLayout()
         self.playback_play_button = QPushButton("再生")
@@ -793,15 +816,38 @@ class WaveformView(QWidget):
         self.pan_slider.setToolTip("波形の表示位置を横スクロール")
         self.pan_slider.valueChanged.connect(self._on_pan_changed)
         view_controls.addWidget(self.pan_slider, 1)
+        self.marker_labels_check = QCheckBox("分類ラベル")
+        self.marker_labels_check.setChecked(True)
+        self.marker_labels_check.setAccessibleName("波形の分類ラベル表示")
+        self.marker_labels_check.setToolTip("近接したラベルは自動で間引きます")
+        self.marker_labels_check.toggled.connect(self.canvas.update)
+        view_controls.addWidget(self.marker_labels_check)
         layout.addLayout(view_controls)
         self.playback_hint_label = QLabel("解析後に表示")
         self.playback_hint_label.setObjectName("Subtle")
+        self.playback_hint_label.setTextFormat(Qt.RichText)
+        self.playback_hint_label.setMinimumHeight(20)
         layout.addWidget(self.playback_hint_label)
         self.playback_timer = QTimer(self)
         self.playback_timer.setInterval(50)
         self.playback_timer.timeout.connect(self._tick_playback)
         self.canvas.clicked.connect(self._seek_to)
         self._update_controls()
+
+    def _marker_legend_html(self) -> str:
+        counts: dict[str, int] = {}
+        for row in self.rows:
+            key = str(row.get("classification", "BASE"))
+            counts[key] = counts.get(key, 0) + 1
+        order = ("SAME", "GAIN_VARIANT", "DIFFERENT", "UNSURE", "OVERLAP", "BASE", "IGNORED")
+        parts = []
+        for key in order:
+            if counts.get(key):
+                parts.append(
+                    f'<span style="color:{CLASS_COLORS.get(key, "#94a3b8")}">'
+                    f'{CLASS_LABELS.get(key, key)} {counts[key]}</span>'
+                )
+        return " · ".join(parts) or "分類なし"
 
     def _view_range(self) -> tuple[float, float]:
         visible = min(self.duration, max(0.25, self._viewport_seconds)) if self.duration > 0 else self._viewport_seconds
@@ -936,7 +982,8 @@ class WaveformView(QWidget):
             self.subdivision = int(result.settings.get("subdivision", 16) or 16)
             self._follow_playhead = True
             self.selected_id = self.rows[0]["id"] if self.rows else None
-            self.playback_hint_label.setText("色と文字で分類を表示 · 波形クリックでシーク")
+            legend = self._marker_legend_html()
+            self.playback_hint_label.setText(f"色と文字で分類 · {legend} · 波形クリックでシーク")
         self._set_position(self.position)
         self.canvas.update()
 
@@ -1071,9 +1118,9 @@ class MetricCard(QFrame):
     def __init__(self, caption: str, accent: str, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("Panel")
-        self.setMinimumHeight(84)
+        self.setMinimumHeight(68)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setContentsMargins(14, 9, 14, 9)
         self.value = QLabel("—")
         self.value.setObjectName("Value")
         self.value.setStyleSheet(f"color:{accent};")
@@ -1171,7 +1218,7 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(splitter, 1)
 
         left = QFrame()
-        left.setObjectName("Panel")
+        left.setObjectName("SettingsColumn")
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(12, 12, 12, 12)
         left_layout.setSpacing(10)
@@ -1233,7 +1280,9 @@ class MainWindow(QMainWindow):
         self.subdivision_spin = QSpinBox()
         self.subdivision_spin.setRange(1, 128)
         self.subdivision_spin.setValue(16)
-        self.fast_compare_check = QCheckBox("高速比較（代表順が変わる場合があります）")
+        # Keep the compact label in the narrow settings column; the full
+        # behavior note remains available via the accessible name and tooltip.
+        self.fast_compare_check = QCheckBox("高速比較")
         self.fast_compare_check.setAccessibleName("高速比較（代表順が変わる場合があります）")
         self.fast_compare_check.setToolTip("特徴量に近い代表から比較します。結果の代表順が変わる可能性があります。")
         self.bms_channel_combo = QComboBox()
@@ -1359,10 +1408,10 @@ class MainWindow(QMainWindow):
         self.waveform.setObjectName("WaveformView")
         self.waveform.hit_selected.connect(self._select_hit)
         self.waveform.playback_status.connect(self._log)
-        right_layout.addWidget(self.waveform)
+        right_layout.addWidget(self.waveform, 3)
 
         metrics = QGridLayout()
-        metrics.setSpacing(8)
+        metrics.setSpacing(6)
         self.required_card = MetricCard("必要サンプル数", "#67e8f9")
         self.hits_card = MetricCard("検出ヒット数", "#60a5fa")
         self.reuse_card = MetricCard("再利用率", "#34d399")
@@ -1442,7 +1491,7 @@ class MainWindow(QMainWindow):
         review_splitter.addWidget(detail_panel)
         review_splitter.setStretchFactor(0, 4)
         review_splitter.setStretchFactor(1, 1)
-        right_layout.addWidget(review_splitter, 1)
+        right_layout.addWidget(review_splitter, 2)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
