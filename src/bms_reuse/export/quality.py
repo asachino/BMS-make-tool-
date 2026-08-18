@@ -38,10 +38,14 @@ def check_export_quality(result, exported: dict | None = None) -> dict:
     sample_paths = list(sample_paths) if isinstance(sample_paths, (list, tuple)) else []
     expected = int(result.plan.required_samples)
     sample_dir = Path(exported["samples_dir"]) if exported.get("samples_dir") else None
-    sample_requested = "samples" in exported or sample_dir is not None
+    # An empty optional ``samples`` list is how CLI/GUI represent "not
+    # requested".  A directory or at least one referenced file means the
+    # caller requested representative WAV validation.
+    sample_requested = sample_dir is not None or bool(sample_paths)
     sample_files = {Path(path).resolve() for path in sample_paths}
     actual_files = {path.resolve() for path in sample_dir.glob("*.wav")} if sample_dir and sample_dir.is_dir() else set()
     checks = {
+        "sample_folder_exists": sample_dir.is_dir() if sample_dir is not None else True,
         "sample_count_matches_clusters": len(sample_paths) == expected if sample_requested else True,
         "sample_files_exist": all(path.is_file() for path in sample_files) if sample_requested else True,
         "sample_folder_has_no_extra_wav": actual_files == sample_files if sample_dir else True,

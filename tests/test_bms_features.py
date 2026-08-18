@@ -84,6 +84,14 @@ class BmsFeatureTest(unittest.TestCase):
             self.assertFalse(validation["ok"])
             self.assertFalse(validation["checks"]["sample_folder_has_no_extra_wav"])
 
+    def test_validate_exports_treats_empty_optional_samples_as_unrequested(self):
+        hits = [Hit(0, 0, 0.0, [1.0], 0, 1)]
+        plan = ReusePlan([Cluster(1, 0, [0])], [{"hit": 0, "time": 0.0, "sample_id": "sample_001", "gain_db": 0.0}])
+        result = AnalysisResult("stem.wav", 1000, 1.0, hits, [], plan, {}, "source")
+        validation = validate_exports(result, {"samples": [], "samples_dir": None})
+        self.assertTrue(validation["ok"])
+        self.assertTrue(validation["checks"]["sample_folder_exists"])
+
     def test_validate_exports_detects_missing_bms_reference(self):
         hits = [Hit(0, 0, 0.0, [1.0], 0, 1)]
         plan = ReusePlan([Cluster(1, 0, [0])], [{"hit": 0, "time": 0.0, "sample_id": "sample_001", "gain_db": 0.0}])

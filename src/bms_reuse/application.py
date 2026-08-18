@@ -16,9 +16,10 @@ from .classification.classifier import (
     DEFAULT_WAVEFORM_THRESHOLD,
     SIMILARITY_PROFILE_NAME,
 )
-from .clustering.reuse_plan import ReusePlan, build_reuse_plan
+from .clustering.recluster import recluster_plan
+from .clustering.reuse_plan import Cluster, ReusePlan, build_reuse_plan
 from .detection.onset import BPM_SNAP_TOLERANCE_MS, detect_onsets
-from .extraction.hit_extractor import extract_hits
+from .extraction.hit_extractor import Hit, extract_hits
 from .features.feature_extractor import extract_features
 from .project.model import Project
 from .similarity.score import SimilarityReport, compare_hits
@@ -56,6 +57,8 @@ class AnalysisResult:
             "comparisons": len(self.comparisons),
             "comparison_cache_hits": int(self.settings.get("comparison_cache_hits", 0)),
             "compare_mode": self.settings.get("compare_mode", "normal"),
+            "recluster_profile": self.settings.get("recluster_profile", "balanced"),
+            "recluster_thresholds": dict(self.settings.get("recluster_thresholds", {})),
             "timings": dict(self.settings.get("timings", {})),
         }
 
@@ -79,6 +82,17 @@ class AnalysisResult:
             "margin_percent": settings.get("margin_percent"),
             "min_interval_sec": settings.get("min_interval_sec"),
         }
+        recluster = {
+            "profile": settings.get("recluster_profile", "balanced"),
+            "thresholds": settings.get(
+                "recluster_thresholds",
+                {
+                    "waveform": settings.get("threshold", DEFAULT_WAVEFORM_THRESHOLD),
+                    "spectral": settings.get("spectral_threshold", DEFAULT_SPECTRAL_THRESHOLD),
+                    "gain_tolerance_db": DEFAULT_GAIN_TOLERANCE_DB,
+                },
+            ),
+        }
         data.update({
             "schema_version": 2,
             "source_hash": self.source_hash,
@@ -91,7 +105,9 @@ class AnalysisResult:
                 "reproducibility_hash": repro.get("reproducibility_hash", settings.get("settings_hash", "")),
                 "settings_hash": repro.get("settings_hash", settings.get("settings_hash", "")),
                 "grid": grid,
+                "recluster": recluster,
             },
+            "recluster": recluster,
             "review": {
                 "overrides": settings.get("review_overrides", {}),
                 "targets": settings.get("review_targets", {}),
@@ -216,6 +232,263 @@ def exclude_hit(result: AnalysisResult, hit_id: int) -> None:
     overrides = result.settings.setdefault("review_overrides", {})
     overrides[str(hit_id)] = "I"
     refresh_reproducibility(result)
+
+
+def analysis_result_from_dict(data: dict) -> AnalysisResult:
+    """Rehydrate a saved schema-v1/v2 analysis without loading audio.
+
+    The reconstructed hits intentionally contain only their serialized
+    features and source coordinates.  This is sufficient for
+    :func:`recluster_result`; representative WAV export can still use the
+    source coordinates if the original source file is available.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("解析JSONの形式が不正です")
+    settings = dict(data.get("settings") or {})
+    review = data.get("review") or {}
+    for key in ("review_overrides", "review_targets", "excluded_hits"):
+        review_key = key.removeprefix("review_")
+        if key not in settings and review_key in review:
+            settings[key] = review[review_key]
+    recluster = data.get("recluster") or (data.get("metadata") or {}).get("recluster") or {}
+    if isinstance(recluster, dict):
+        if "profile" in recluster and "recluster_profile" not in settings:
+            settings["recluster_profile"] = recluster["profile"]
+        if "thresholds" in recluster and "recluster_thresholds" not in settings:
+            settings["recluster_thresholds"] = recluster["thresholds"]
+    exports = data.get("exports")
+    if exports is not None and "exports" not in settings:
+        settings["exports"] = exports
+    if "validation" in data and "validation" not in settings:
+        settings["validation"] = data["validation"]
+    hits = []
+    for raw in data.get("hits", []):
+        raw = dict(raw)
+        hits.append(Hit(
+            int(raw.get("id", len(hits))),
+            int(raw.get("sample", raw.get("onset_sample", 0))),
+            float(raw.get("time", 0.0)),
+            raw.get("samples", []),
+            int(raw.get("source_start", 0)),
+            int(raw.get("source_end", 0)),
+            bool(raw.get("overlap_warning", False)),
+            dict(raw.get("features") or {}),
+        ))
+    comparisons = []
+    report_fields = {
+        "reference_id", "candidate_id", "raw_similarity", "gain_normalized_similarity",
+        "gain_db", "spectral_similarity", "attack_similarity", "body_similarity",
+        "tail_similarity", "alignment_samples", "overlap_warning", "classification", "confidence",
+    }
+    for raw in data.get("comparisons", []):
+        values = {key: raw[key] for key in report_fields if key in raw}
+        try:
+            comparisons.append(SimilarityReport(
+                int(values["reference_id"]), int(values["candidate_id"]),
+                float(values.get("raw_similarity", 0.0)),
+                float(values.get("gain_normalized_similarity", 0.0)),
+                float(values.get("gain_db", 0.0)),
+                float(values.get("spectral_similarity", 0.0)),
+                float(values.get("attack_similarity", 0.0)),
+                float(values.get("body_similarity", 0.0)),
+                float(values.get("tail_similarity", 0.0)),
+                int(values.get("alignment_samples", 0)),
+                bool(values.get("overlap_warning", False)),
+                str(values.get("classification", "UNSURE")),
+                float(values.get("confidence", 0.0)),
+            ))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("解析JSONのcomparison形式が不正です") from exc
+    raw_clusters = data.get("clusters") or []
+    clusters = [
+        Cluster(
+            int(raw.get("id", index + 1)),
+            int(raw.get("representative_hit", 0)),
+            [int(hit_id) for hit_id in raw.get("hit_ids", [])],
+        )
+        for index, raw in enumerate(raw_clusters)
+    ]
+    plan_data = data.get("reuse_plan") or {}
+    events = [dict(event) for event in plan_data.get("events", [])]
+    return AnalysisResult(
+        str(data.get("source", "")),
+        int(data.get("sample_rate", 0)),
+        float(data.get("duration", 0.0)),
+        hits,
+        comparisons,
+        ReusePlan(clusters, events),
+        settings,
+        str(data.get("source_hash") or (data.get("metadata") or {}).get("source_hash", "")),
+    )
+
+
+def _update_review_targets(result: AnalysisResult) -> None:
+    targets = result.settings.get("review_targets", {})
+    targets = dict(targets) if isinstance(targets, dict) else {}
+    cluster_by_hit = {
+        int(hit_id): int(cluster.id)
+        for cluster in result.plan.clusters
+        for hit_id in cluster.hit_ids
+    }
+    overrides = result.settings.get("review_overrides", {}) or {}
+    for hit_id, value in overrides.items():
+        if str(value).upper() in {"S", "G"} and _safe_int(hit_id) in cluster_by_hit:
+            targets[str(hit_id)] = cluster_by_hit[_safe_int(hit_id)]
+    result.settings["review_targets"] = {
+        str(hit_id): cluster_by_hit[int(hit_id)]
+        for hit_id, value in targets.items()
+        if _safe_int(hit_id) in cluster_by_hit
+        and str(overrides.get(str(hit_id), overrides.get(hit_id, ""))).upper() in {"S", "G"}
+    }
+
+
+def _refresh_recluster_exports(result: AnalysisResult, *, reexport: bool) -> None:
+    """Keep existing export references aligned with the new cluster IDs."""
+    exports = result.settings.get("exports")
+    if not isinstance(exports, dict):
+        return
+    samples_dir = exports.get("samples_dir")
+    sample_paths = exports.get("samples")
+    old_sample_paths = {
+        Path(path).resolve()
+        for path in sample_paths
+    } if isinstance(sample_paths, list) else set()
+    if not samples_dir and isinstance(sample_paths, list) and sample_paths:
+        samples_dir = str(Path(sample_paths[0]).parent)
+    if samples_dir:
+        samples_dir_path = Path(samples_dir)
+        exports["samples_dir"] = str(samples_dir_path)
+        expected_paths = [str(samples_dir_path / f"sample_{cluster.id:03d}.wav") for cluster in result.plan.clusters]
+        exports["samples"] = expected_paths
+        exports["sample_count"] = len(expected_paths)
+    result.settings["exports"] = exports
+    result.settings["validation"] = {
+        "ok": False,
+        "reason": "reclustered; export refresh required",
+    }
+    if not reexport:
+        return
+    try:
+        from .audio.loader import load_audio
+        from .export.bms_exporter import relative_sample_prefix, write_bms
+        from .export.bmson_exporter import write_bmson
+        from .export.csv_exporter import write_hits_csv
+        from .export.json_exporter import write_json
+        from .export.quality import validate_exports
+        from .export.wav_exporter import write_hit_wavs
+
+        if samples_dir:
+            audio = load_audio(result.source)
+            exports["samples"] = [
+                str(path) for path in write_hit_wavs(
+                    samples_dir,
+                    audio,
+                    result.hits,
+                    result.plan,
+                    fade_in_ms=float(result.settings.get("fade_in_ms", 0.0)),
+                    fade_out_ms=float(result.settings.get("fade_out_ms", 0.0)),
+                )
+            ]
+            new_sample_paths = {Path(path).resolve() for path in exports["samples"]}
+            stale_candidates = old_sample_paths | {
+                path.resolve() for path in Path(samples_dir).glob("sample_*.wav")
+            }
+            for stale in stale_candidates - new_sample_paths:
+                if stale.name.startswith("sample_") and stale.suffix.casefold() == ".wav":
+                    stale.unlink(missing_ok=True)
+        if exports.get("csv"):
+            write_hits_csv(exports["csv"], result.hits, result.plan.events)
+        if exports.get("bms"):
+            write_bms(
+                exports["bms"],
+                result.plan,
+                bpm=result.settings.get("bpm"),
+                offset=float(result.settings.get("offset", 0.0)),
+                subdivision=int(result.settings.get("subdivision", 16)),
+                channel=str(result.settings.get("bms_channel", "01")),
+                wav_prefix=relative_sample_prefix(exports["bms"], samples_dir),
+            )
+        if exports.get("bmson"):
+            write_bmson(
+                exports["bmson"],
+                result.plan,
+                bpm=result.settings.get("bpm"),
+                offset=float(result.settings.get("offset", 0.0)),
+            )
+        result.settings["exports"] = exports
+        result.settings["validation"] = validate_exports(result, exports)
+        if exports.get("json"):
+            write_json(exports["json"], result.to_dict())
+    except (OSError, ValueError, RuntimeError) as exc:
+        result.settings["validation"] = {
+            "ok": False,
+            "reason": "recluster export failed",
+            "error": str(exc),
+        }
+
+
+def recluster_result(
+    result: AnalysisResult,
+    *,
+    profile: str | float | int | None = None,
+    reuse_level: str | float | int | None = None,
+    threshold: float | None = None,
+    spectral_threshold: float | None = None,
+    gain_tolerance_db: float | None = None,
+    reexport: bool = True,
+) -> AnalysisResult:
+    """Recluster an existing result without audio decoding or FFT.
+
+    This is the small GUI data contract: pass an ``AnalysisResult`` returned
+    by :func:`analyze_file` and one of ``strict``, ``balanced``, ``aggressive``
+    or a numeric ``threshold``/``reuse_level``.  The same object is returned
+    after clusters, events, comparisons, review targets, exports and hashes
+    are updated.  Set ``reexport=False`` to update JSON metadata only.
+    """
+    plan, comparisons, profile_name, thresholds = recluster_plan(
+        result.hits,
+        result.comparisons,
+        result.plan,
+        settings=result.settings,
+        profile=profile,
+        reuse_level=reuse_level,
+        threshold=threshold,
+        spectral_threshold=spectral_threshold,
+        gain_tolerance_db=gain_tolerance_db,
+    )
+    excluded = {
+        int(hit_id)
+        for hit_id in (result.settings.get("excluded_hits", []) or [])
+    }
+    overrides = result.settings.get("review_overrides", {}) or {}
+    excluded.update(int(hit_id) for hit_id, value in overrides.items() if str(value).upper() == "I")
+    result.hits[:] = [hit for hit in result.hits if int(hit.id) not in excluded]
+    result.plan = plan
+    result.comparisons[:] = comparisons
+    result.settings["excluded_hits"] = sorted(excluded)
+    result.settings["recluster_profile"] = profile_name
+    result.settings["recluster_thresholds"] = thresholds
+    # Keep the legacy threshold keys and the displayed similarity profile in
+    # sync for existing CLI/GUI consumers while retaining the original base
+    # thresholds for a later named-profile reset.
+    result.settings["threshold"] = thresholds["waveform"]
+    result.settings["spectral_threshold"] = thresholds["spectral"]
+    similarity_profile = dict(result.settings.get("similarity_profile", {}))
+    similarity_profile.update(
+        {
+            "waveform_threshold": thresholds["waveform"],
+            "spectral_threshold": thresholds["spectral"],
+        }
+    )
+    result.settings["similarity_profile"] = similarity_profile
+    result.settings["comparison_count"] = len(comparisons)
+    result.settings["comparison_cache_hits"] = 0
+    result.settings["comparison_cache_entries"] = 0
+    result.settings["compare_mode"] = "recluster"
+    _update_review_targets(result)
+    refresh_reproducibility(result)
+    _refresh_recluster_exports(result, reexport=reexport)
+    return result
 
 
 def _sha256(path: Path) -> str:
@@ -409,6 +682,16 @@ def analyze_file(
         "fade_in_ms": fade_in_ms,
         "fade_out_ms": fade_out_ms,
         "bms_channel": bms_channel,
+        "recluster_profile": "balanced",
+        "recluster_thresholds": {
+            "waveform": threshold,
+            "spectral": spectral_threshold,
+            "gain_tolerance_db": DEFAULT_GAIN_TOLERANCE_DB,
+        },
+        "recluster_base_thresholds": {
+            "waveform": threshold,
+            "spectral": spectral_threshold,
+        },
         "similarity_profile": {
             "name": SIMILARITY_PROFILE_NAME,
             "waveform_threshold": threshold,

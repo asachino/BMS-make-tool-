@@ -52,7 +52,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised by the CLI-only install
     raise RuntimeError("GUI requires PySide6. Install with: pip install .[gui]") from exc
 
-from .application import AnalysisCancelled, AnalysisResult, analyze_file, exclude_hit, record_output_timing, refresh_reproducibility
+from .application import AnalysisCancelled, AnalysisResult, analyze_file, exclude_hit, recluster_result, record_output_timing, refresh_reproducibility
 from .batch import run_batch
 from ._numeric import np
 from .audio.loader import load_audio, mono_signal
@@ -146,6 +146,7 @@ QFrame#Panel { background: #1b1f26; border: 1px solid #303640; border-radius: 8p
 QGroupBox { background: transparent; border: 1px solid #303640; border-radius: 8px; }
 QFrame#DropZone { border: 1px dashed #66707f; background: #1c222b; border-radius: 8px; }
 QFrame#DropZone[dragActive="true"] { background: #242a33; border: 1px solid #8a95a5; }
+QWidget#WaveformView { background: transparent; border: none; }
 QLabel#Brand { color: #dce2ea; font-size: 17pt; font-weight: 700; letter-spacing: 1px; }
 QLabel#Kicker { color: #9aa4b2; font-size: 8pt; font-weight: 700; letter-spacing: 1px; }
 QLabel#Title { color: #ffffff; font-size: 20pt; font-weight: 700; }
@@ -190,6 +191,7 @@ QFrame#Panel { background: #ffffff; border: 1px solid #dfe4eb; border-radius: 8p
 QGroupBox { background: transparent; border: 1px solid #dfe4eb; border-radius: 8px; }
 QFrame#DropZone { border: 1px dashed #aab7c7; background: #f8fafc; border-radius: 8px; }
 QFrame#DropZone[dragActive="true"] { background: #eef2f6; border: 1px solid #8d9aaa; }
+QWidget#WaveformView { background: transparent; border: none; }
 QLabel#Brand { color: #344054; font-size: 17pt; font-weight: 700; letter-spacing: 1px; }
 QLabel#Kicker { color: #667085; font-size: 8pt; font-weight: 700; letter-spacing: 1px; }
 QLabel#Title { color: #102033; font-size: 20pt; font-weight: 700; }
@@ -478,26 +480,36 @@ class DropZone(QFrame):
             super().keyPressEvent(event)
 
 
-def _waveform_envelope(audio, max_points: int = 1600) -> list[tuple[float, float]]:
-    """Shrink a long source WAV to min/max buckets for fast QPainter drawing."""
+def _waveform_envelope(audio, max_points: int = 1600) -> list[tuple[float, ...]]:
+    """Shrink the real source samples to min/max buckets for QPainter."""
     frame_count = audio.frame_count
     if frame_count <= 0:
         return []
-    signal = mono_signal(audio)
     bucket_count = min(max_points, frame_count)
-    points: list[tuple[float, float]] = []
+    samples = audio.samples
+    stereo = int(getattr(audio, "channels", 1)) >= 2 and hasattr(samples, "shape") and len(samples.shape) > 1
+    mono = None if stereo else mono_signal(audio)
+    points: list[tuple[float, ...]] = []
     for index in range(bucket_count):
         start = index * frame_count // bucket_count
         end = max(start + 1, (index + 1) * frame_count // bucket_count)
-        chunk = signal[start:end]
-        if np is not None and hasattr(chunk, "shape"):
-            low = float(np.min(chunk))
-            high = float(np.max(chunk))
+        chunk = samples[start:end]
+        if stereo:
+            values = []
+            for channel in (0, 1):
+                channel_chunk = chunk[:, channel]
+                values.extend((float(np.min(channel_chunk)), float(np.max(channel_chunk))))
+            points.append(tuple(values))
         else:
-            values = [float(value) for value in chunk]
-            low = min(values, default=0.0)
-            high = max(values, default=0.0)
-        points.append((low, high))
+            mono_chunk = mono[start:end]
+            if np is not None and hasattr(mono_chunk, "shape"):
+                low = float(np.min(mono_chunk))
+                high = float(np.max(mono_chunk))
+            else:
+                values = [float(value) for value in mono_chunk]
+                low = min(values, default=0.0)
+                high = max(values, default=0.0)
+            points.append((low, high))
     return points
 
 
@@ -581,78 +593,91 @@ class WaveformCanvas(QWidget):
         owner = self.owner
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#0a1220"))
-        rect = self.rect().adjusted(10, 8, -10, -28)
+        painter.fillRect(self.rect(), QColor("#b7b9bb"))
+        rect = self.rect().adjusted(10, 8, -10, -30)
         duration = owner.duration
         if duration <= 0:
-            painter.setPen(QColor("#64748b"))
+            painter.setPen(QColor("#4f555a"))
             painter.drawText(rect, Qt.AlignCenter, "解析後に表示")
             return
 
         start, visible = owner._view_range()
         end = start + visible
-        painter.setPen(QPen(QColor("#1e3a5f"), 1))
+        painter.setPen(QPen(QColor("#9da1a4"), 1))
         for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
             x = rect.left() + round(rect.width() * fraction)
             painter.drawLine(x, rect.top(), x, rect.bottom())
-            painter.setPen(QColor("#64748b"))
+            painter.setPen(QColor("#4f555a"))
             painter.drawText(x + 3, self.height() - 8, format_seconds(start + visible * fraction))
-            painter.setPen(QPen(QColor("#1e3a5f"), 1))
-        center = rect.center().y()
-        painter.setPen(QPen(QColor("#27435e"), 1))
-        painter.drawLine(rect.left(), center, rect.right(), center)
+            painter.setPen(QPen(QColor("#9da1a4"), 1))
 
-        points = owner.waveform_points
-        if points:
-            painter.setPen(QPen(QColor("#72b7ff"), 1))
-            denominator = max(1, len(points) - 1)
-            half_height = max(1, rect.height() // 2 - 3)
-            for index, (low, high) in enumerate(points):
-                point_time = duration * index / denominator
-                if point_time < start or point_time > end:
-                    continue
-                x = rect.left() + round((point_time - start) / max(visible, 1e-9) * rect.width())
-                top = center - round(max(-1.0, min(1.0, high)) * half_height)
-                bottom = center - round(max(-1.0, min(1.0, low)) * half_height)
-                painter.drawLine(x, top, x, bottom)
-        elif not owner.source_path:
-            painter.setPen(QColor("#64748b"))
-            painter.drawText(rect, Qt.AlignCenter, "入力WAVを選択すると波形を表示")
-
-        # BMS grid: subdivision is per beat; every fourth beat is a measure.
+        # Thin musical grid lines sit behind the real source waveform.
         if owner.bpm and owner.bpm > 0:
-            step = 60.0 / owner.bpm / max(1, owner.subdivision)
-            grid_time = owner.offset + max(0, int((start - owner.offset) / step) - 1) * step
-            while grid_time <= end + step:
+            beat_step = 60.0 / owner.bpm / max(1, owner.subdivision)
+            grid_step = beat_step
+            while visible / max(grid_step, 1e-9) > max(200, rect.width() * 2):
+                grid_step *= 2.0
+            grid_time = owner.offset + max(0, int((start - owner.offset) / grid_step) - 1) * grid_step
+            while grid_time <= end + grid_step:
                 if grid_time >= start:
                     fraction = (grid_time - start) / max(visible, 1e-9)
                     x = rect.left() + round(fraction * rect.width())
-                    beat_index = round((grid_time - owner.offset) / step)
+                    beat_index = round((grid_time - owner.offset) / beat_step)
                     if beat_index % (owner.subdivision * 4) == 0:
-                        color, width, label = QColor("#6484a6"), 2, f"小節{beat_index // (owner.subdivision * 4) + 1}"
+                        color, width, label = QColor("#777d82"), 2, f"小節{beat_index // (owner.subdivision * 4) + 1}"
                     elif beat_index % owner.subdivision == 0:
-                        color, width, label = QColor("#3f5d7e"), 1, "拍"
+                        color, width, label = QColor("#8f9599"), 1, "拍"
                     else:
-                        color, width, label = QColor("#263e58"), 1, ""
+                        color, width, label = QColor("#a5a9ac"), 1, ""
                     painter.setPen(QPen(color, width))
                     painter.drawLine(x, rect.top(), x, rect.bottom())
                     if label:
                         painter.setPen(color)
-                        painter.drawText(x + 3, rect.top() + 12, label)
-                grid_time += step
+                        painter.drawText(x + 3, rect.top() + 13, label)
+                grid_time += grid_step
 
-        # Show each extracted source range as a quiet band behind its marker.
-        if owner.rows and owner.sample_rate > 0:
-            for row in owner.rows:
-                band_start = float(row.get("start", row.get("time", 0.0)))
-                band_end = float(row.get("end", band_start))
-                if band_end < start or band_start > end:
+        points = owner.waveform_points
+        stereo = bool(points and len(points[0]) >= 4)
+        if stereo:
+            channel_height = max(1, (rect.height() - 8) // 2)
+            channel_rects = (
+                QRect(rect.left(), rect.top(), rect.width(), channel_height),
+                QRect(rect.left(), rect.top() + channel_height + 8, rect.width(), channel_height),
+            )
+        else:
+            channel_rects = (rect,)
+        painter.setPen(QPen(QColor("#8f9599"), 1))
+        for channel_rect in channel_rects:
+            center = channel_rect.center().y()
+            painter.drawLine(channel_rect.left(), center, channel_rect.right(), center)
+
+        if points:
+            painter.setPen(QPen(QColor("#20262b"), 1))
+            denominator = max(1, len(points) - 1)
+            for index, point in enumerate(points):
+                point_time = duration * index / denominator
+                if point_time < start or point_time > end:
                     continue
-                left_x = rect.left() + round((band_start - start) / max(visible, 1e-9) * rect.width())
-                right_x = rect.left() + round((band_end - start) / max(visible, 1e-9) * rect.width())
-                color = QColor(CLASS_COLORS.get(row["classification"], "#94a3b8"))
-                color.setAlpha(32)
-                painter.fillRect(max(rect.left(), left_x), rect.top(), max(1, min(rect.right(), right_x) - max(rect.left(), left_x)), rect.height(), color)
+                x = rect.left() + round((point_time - start) / max(visible, 1e-9) * rect.width())
+                if len(point) >= 4:
+                    for channel_index, (low, high) in enumerate(((point[0], point[1]), (point[2], point[3]))):
+                        channel_rect = channel_rects[channel_index]
+                        center = channel_rect.center().y()
+                        half_height = max(1, channel_rect.height() // 2 - 3)
+                        top = center - round(max(-1.0, min(1.0, high)) * half_height)
+                        bottom = center - round(max(-1.0, min(1.0, low)) * half_height)
+                        painter.drawLine(x, top, x, bottom)
+                else:
+                    low, high = point[0], point[1]
+                    channel_rect = channel_rects[0]
+                    center = channel_rect.center().y()
+                    half_height = max(1, channel_rect.height() // 2 - 3)
+                    top = center - round(max(-1.0, min(1.0, high)) * half_height)
+                    bottom = center - round(max(-1.0, min(1.0, low)) * half_height)
+                    painter.drawLine(x, top, x, bottom)
+        elif not owner.source_path:
+            painter.setPen(QColor("#4f555a"))
+            painter.drawText(rect, Qt.AlignCenter, "入力WAVを選択すると波形を表示")
 
         nearest_id = None
         if owner.rows and owner.position >= 0:
@@ -701,8 +726,10 @@ class WaveformView(QWidget):
         self.selected_id: int | None = None
         self.source_path: Path | None = None
         self.audio = None
-        self.waveform_points: list[tuple[float, float]] = []
+        self.waveform_points: list[tuple[float, ...]] = []
         self._viewport_seconds = 12.0
+        self._view_start = 0.0
+        self._follow_playhead = True
         self._playing = False
         self._playback_started_at = 0.0
         self._playback_offset = 0.0
@@ -747,6 +774,26 @@ class WaveformView(QWidget):
         self.playback_time_label.setMinimumWidth(125)
         controls.addWidget(self.playback_time_label)
         layout.addLayout(controls)
+        view_controls = QHBoxLayout()
+        view_controls.addWidget(QLabel("表示幅"))
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(1, 120)
+        self.zoom_slider.setValue(12)
+        self.zoom_slider.setAccessibleName("波形表示幅")
+        self.zoom_slider.setToolTip("波形を拡大・縮小（表示秒数）")
+        self.zoom_slider.valueChanged.connect(self._on_zoom_changed)
+        view_controls.addWidget(self.zoom_slider, 1)
+        self.zoom_label = QLabel("12.0秒")
+        self.zoom_label.setMinimumWidth(58)
+        view_controls.addWidget(self.zoom_label)
+        view_controls.addWidget(QLabel("横位置"))
+        self.pan_slider = QSlider(Qt.Horizontal)
+        self.pan_slider.setRange(0, 10000)
+        self.pan_slider.setAccessibleName("波形横位置")
+        self.pan_slider.setToolTip("波形の表示位置を横スクロール")
+        self.pan_slider.valueChanged.connect(self._on_pan_changed)
+        view_controls.addWidget(self.pan_slider, 1)
+        layout.addLayout(view_controls)
         self.playback_hint_label = QLabel("解析後に表示")
         self.playback_hint_label.setObjectName("Subtle")
         layout.addWidget(self.playback_hint_label)
@@ -757,9 +804,39 @@ class WaveformView(QWidget):
         self._update_controls()
 
     def _view_range(self) -> tuple[float, float]:
-        visible = min(self.duration, self._viewport_seconds) if self.duration > 0 else self._viewport_seconds
-        start = max(0.0, min(self.position - visible / 2.0, max(0.0, self.duration - visible)))
+        visible = min(self.duration, max(0.25, self._viewport_seconds)) if self.duration > 0 else self._viewport_seconds
+        start = self.position - visible / 2.0 if self._follow_playhead else self._view_start
+        start = max(0.0, min(start, max(0.0, self.duration - visible)))
         return start, max(visible, 0.001)
+
+    def _sync_pan_slider(self) -> None:
+        if not hasattr(self, "pan_slider"):
+            return
+        start, visible = self._view_range()
+        maximum = max(0.0, self.duration - visible)
+        value = round(start / maximum * 10000) if maximum > 0 else 0
+        self.pan_slider.blockSignals(True)
+        self.pan_slider.setValue(max(0, min(10000, value)))
+        self.pan_slider.blockSignals(False)
+
+    def _on_zoom_changed(self, value: int) -> None:
+        old_start, old_visible = self._view_range()
+        center = old_start + old_visible / 2.0
+        self._viewport_seconds = max(1.0, float(value))
+        self.zoom_label.setText(f"{self._viewport_seconds:.1f}秒")
+        self._follow_playhead = False
+        self._view_start = center - self._viewport_seconds / 2.0
+        self._sync_pan_slider()
+        self.canvas.update()
+
+    def _on_pan_changed(self, value: int) -> None:
+        if self.duration <= 0:
+            return
+        visible = min(self.duration, max(0.25, self._viewport_seconds))
+        maximum = max(0.0, self.duration - visible)
+        self._view_start = maximum * max(0, min(10000, int(value))) / 10000.0
+        self._follow_playhead = False
+        self.canvas.update()
 
     def _update_controls(self) -> None:
         enabled = self.audio is not None and self.duration > 0
@@ -767,6 +844,8 @@ class WaveformView(QWidget):
         self.playback_pause_button.setEnabled(enabled and self._playing)
         self.playback_stop_button.setEnabled(enabled and (self._playing or self.position > 0))
         self.seek_slider.setEnabled(enabled)
+        self.zoom_slider.setEnabled(enabled)
+        self.pan_slider.setEnabled(enabled and self.duration > self._viewport_seconds)
         self.playback_time_label.setText(f"{format_seconds(self.position)} / {format_seconds(self.duration)}")
 
     def _set_position(self, position: float) -> None:
@@ -775,6 +854,7 @@ class WaveformView(QWidget):
         self.seek_slider.setValue(round(self.position / max(self.duration, 1e-9) * 10000))
         self.seek_slider.blockSignals(False)
         self._update_controls()
+        self._sync_pan_slider()
         self.canvas.update()
 
     def _slider_pressed(self) -> None:
@@ -797,6 +877,8 @@ class WaveformView(QWidget):
         self.rows = []
         self.selected_id = None
         self.waveform_points = []
+        self._view_start = 0.0
+        self._follow_playhead = True
         self.playback_hint_label.setText("波形を読み込み中…")
         self._update_controls()
         self.canvas.update()
@@ -832,6 +914,8 @@ class WaveformView(QWidget):
         self.duration = audio.duration
         self.position = 0.0
         self.waveform_points = _waveform_envelope(audio)
+        self._view_start = 0.0
+        self._follow_playhead = True
         self.playback_hint_label.setText("解析後にオンセット・分類マーカーを表示")
         self._update_controls()
         self.canvas.update()
@@ -850,6 +934,7 @@ class WaveformView(QWidget):
             self.bpm = result.settings.get("bpm")
             self.offset = float(result.settings.get("offset", 0.0) or 0.0)
             self.subdivision = int(result.settings.get("subdivision", 16) or 16)
+            self._follow_playhead = True
             self.selected_id = self.rows[0]["id"] if self.rows else None
             self.playback_hint_label.setText("色と文字で分類を表示 · 波形クリックでシーク")
         self._set_position(self.position)
@@ -922,6 +1007,7 @@ class WaveformView(QWidget):
     def play_playback(self) -> None:
         if self._playing:
             return
+        self._follow_playhead = True
         self._play_from(self.position)
 
     def pause_playback(self) -> None:
@@ -1013,6 +1099,7 @@ class MainWindow(QMainWindow):
         self._last_progress_message = ""
         self._processing_stage = "待機中"
         self._analysis_started_at: float | None = None
+        self._cluster_base_thresholds = (0.95, 0.94)
         self.processing_timer = QTimer(self)
         self.processing_timer.setInterval(150)
         self.processing_timer.timeout.connect(self._refresh_processing_status)
@@ -1172,6 +1259,40 @@ class MainWindow(QMainWindow):
         add_setting_row("BMSチャンネル", self.bms_channel_combo)
         left_layout.addWidget(settings_box)
 
+        self.cluster_box = QGroupBox("使い回し度")
+        cluster_form = QFormLayout(self.cluster_box)
+        cluster_form.setContentsMargins(0, 4, 0, 0)
+        cluster_form.setHorizontalSpacing(12)
+        cluster_form.setVerticalSpacing(7)
+        cluster_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        self.cluster_slider = QSlider(Qt.Horizontal)
+        self.cluster_slider.setRange(70, 100)
+        self.cluster_slider.setValue(95)
+        self.cluster_slider.setAccessibleName("使い回し度")
+        self.cluster_slider.setToolTip("解析後の保存済み比較を再分類。左は厳格、右は積極的")
+        self.cluster_slider.valueChanged.connect(self._update_cluster_threshold_label)
+        cluster_form.addRow("類似度基準", self.cluster_slider)
+        self.cluster_threshold_label = QLabel("95%（波形0.950・スペクトル0.940）")
+        self.cluster_threshold_label.setObjectName("Subtle")
+        cluster_form.addRow("実効値", self.cluster_threshold_label)
+        self.cluster_hint_label = QLabel("解析後に再解析なしで適用できます")
+        self.cluster_hint_label.setObjectName("Subtle")
+        self.cluster_hint_label.setWordWrap(True)
+        cluster_form.addRow("", self.cluster_hint_label)
+        cluster_actions = QHBoxLayout()
+        self.cluster_apply_button = QPushButton("適用")
+        self.cluster_apply_button.setObjectName("Primary")
+        self.cluster_apply_button.setToolTip("保存済みの比較結果でクラスタを作り直します")
+        self.cluster_apply_button.clicked.connect(self._apply_cluster_threshold)
+        self.cluster_reset_button = QPushButton("初期値に戻す")
+        self.cluster_reset_button.setToolTip("解析開始時の類似度基準に戻して適用")
+        self.cluster_reset_button.clicked.connect(self._reset_cluster_threshold)
+        cluster_actions.addWidget(self.cluster_apply_button)
+        cluster_actions.addWidget(self.cluster_reset_button)
+        cluster_form.addRow("", cluster_actions)
+        self.cluster_box.setEnabled(False)
+        left_layout.addWidget(self.cluster_box)
+
         output_box = QGroupBox("出力")
         output_layout = QVBoxLayout(output_box)
         output_layout.setContentsMargins(0, 4, 0, 0)
@@ -1235,7 +1356,7 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(10)
         self.waveform = WaveformView()
-        self.waveform.setObjectName("Panel")
+        self.waveform.setObjectName("WaveformView")
         self.waveform.hit_selected.connect(self._select_hit)
         self.waveform.playback_status.connect(self._log)
         right_layout.addWidget(self.waveform)
@@ -1641,6 +1762,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(running)
         self.drop_zone.setEnabled(not running)
         self.input_edit.setEnabled(not running)
+        self._update_cluster_controls(running)
         if running:
             self.progress_bar.setValue(0)
             self.status_label.setText("解析中…")
@@ -1654,6 +1776,63 @@ class MainWindow(QMainWindow):
             self.status_label.setText("準備完了" if self.result is None else "解析結果を表示中")
             self.processing_status_label.setText("待機中" if self.result is None else "解析結果を表示中")
             self._update_start_enabled()
+
+    def _update_cluster_controls(self, running: bool | None = None) -> None:
+        if not hasattr(self, "cluster_box"):
+            return
+        if running is None:
+            running = bool(self.worker and self.worker.isRunning())
+        self.cluster_box.setEnabled(bool(self.result) and not running)
+
+    def _update_cluster_threshold_label(self, value: int) -> None:
+        base_waveform, base_spectral = self._cluster_base_thresholds
+        waveform = max(0.0, min(1.0, int(value) / 100.0))
+        spectral = max(0.0, min(1.0, base_spectral + waveform - base_waveform))
+        self.cluster_threshold_label.setText(f"{int(value)}%（波形{waveform:.3f}・スペクトル{spectral:.3f}）")
+
+    def _cluster_threshold_values(self) -> tuple[float, float]:
+        base_waveform, base_spectral = self._cluster_base_thresholds
+        waveform = int(self.cluster_slider.value()) / 100.0
+        spectral = max(0.0, min(1.0, base_spectral + waveform - base_waveform))
+        return waveform, spectral
+
+    def _apply_cluster_threshold(self) -> None:
+        if not self.result or (self.worker and self.worker.isRunning()):
+            return
+        started = time.perf_counter()
+        waveform, spectral = self._cluster_threshold_values()
+        try:
+            recluster_result(
+                self.result,
+                threshold=waveform,
+                spectral_threshold=spectral,
+                reexport=True,
+            )
+            profile_name = self.result.settings.get("recluster_profile", "custom")
+            self.result.settings.setdefault("timings", {})["recluster_seconds"] = round(time.perf_counter() - started, 6)
+            self.rows = classify_hits(self.result)
+            self.waveform.set_result(self.result)
+            summary = self.result.summary
+            self.required_card.value.setText(str(summary["required_samples"]))
+            self.hits_card.value.setText(str(summary["detected_hits"]))
+            self.reuse_card.value.setText(f"{summary['reuse_ratio']:.1f}%")
+            self.review_card.value.setText(str(sum(row["classification"] in {"UNSURE", "OVERLAP"} for row in self.rows)))
+            self._refresh_table()
+            self.sample_list.clear()
+            for cluster in self.result.plan.clusters:
+                self.sample_list.addItem(QListWidgetItem(f"sample_{cluster.id:03d}"))
+            self._save_review_state()
+            self._log(
+                f"使い回し度を{int(self.cluster_slider.value())}%で適用: "
+                f"{len(self.result.plan.clusters)}クラスタ · 判定{profile_name}"
+            )
+        except (OSError, ValueError, RuntimeError, TypeError) as exc:
+            self._show_error("クラスタ設定を適用できません", str(exc))
+
+    def _reset_cluster_threshold(self) -> None:
+        waveform, _spectral = self._cluster_base_thresholds
+        self.cluster_slider.setValue(round(waveform * 100.0))
+        self._apply_cluster_threshold()
 
     def start_analysis(self) -> None:
         if self.worker and self.worker.isRunning():
@@ -1718,6 +1897,15 @@ class MainWindow(QMainWindow):
     @Slot(object, object)
     def _on_result(self, result: AnalysisResult, exported: dict) -> None:
         self.result, self.exported = result, exported
+        self._cluster_base_thresholds = (
+            float(result.settings.get("threshold", 0.95)),
+            float(result.settings.get("spectral_threshold", 0.94)),
+        )
+        self.cluster_slider.blockSignals(True)
+        self.cluster_slider.setValue(max(70, min(100, round(self._cluster_base_thresholds[0] * 100.0))))
+        self.cluster_slider.blockSignals(False)
+        self._update_cluster_threshold_label(self.cluster_slider.value())
+        self._update_cluster_controls(False)
         self.rows = classify_hits(result)
         self.waveform.set_result(result)
         summary = result.summary
@@ -1890,7 +2078,7 @@ class MainWindow(QMainWindow):
         if not self.result:
             return
         json_path = self.json_edit.text().strip()
-        if not json_path:
+        if not json_path and not isinstance(self.exported, dict):
             return
         try:
             excluded = {int(value) for value in self.result.settings.get("excluded_hits", [])}
@@ -1930,7 +2118,8 @@ class MainWindow(QMainWindow):
             outputs["validation"] = validate_exports(self.result, outputs)
             self.result.settings["validation"] = outputs["validation"]
             self.result.settings["exports"] = {key: value for key, value in outputs.items() if key != "validation"}
-            write_json(json_path, self.result.to_dict())
+            if json_path:
+                write_json(json_path, self.result.to_dict())
         except OSError as exc:
             self._log(f"レビュー保存エラー: {exc}")
 

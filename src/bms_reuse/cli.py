@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from .application import analyze_file, record_output_timing
+from .application import analysis_result_from_dict, analyze_file, recluster_result, record_output_timing
 from .batch import run_batch
 from .export.csv_exporter import write_hits_csv
 from .export.json_exporter import write_json
@@ -68,6 +68,14 @@ def _parser() -> argparse.ArgumentParser:
     batch.add_argument("--fade-out-ms", type=float, default=0.0)
     batch.add_argument("--bms", action="store_true", help="write BMS per input (requires --bpm)")
     batch.add_argument("--bmson", action="store_true", help="write BMSON per input (requires --bpm)")
+    recluster = commands.add_parser("recluster", help="reuse saved comparisons to change clustering without re-analysis")
+    recluster.add_argument("input", type=Path, help="analysis JSON from analyze")
+    recluster.add_argument("--output", type=Path, help="output JSON (default: <input>.recluster.bra.json)")
+    recluster.add_argument("--reuse-level", default="balanced", help="strict, balanced, aggressive, or a numeric threshold")
+    recluster.add_argument("--threshold", type=float, help="continuous waveform threshold")
+    recluster.add_argument("--spectral-threshold", type=float)
+    recluster.add_argument("--no-reexport", action="store_true", help="update JSON only; do not rewrite existing exports")
+    recluster.add_argument("--full-json", action="store_true", help="print the complete JSON result")
     return parser
 
 
@@ -94,6 +102,32 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "recluster":
+        try:
+            output = args.output or args.input.with_suffix(".recluster.bra.json")
+            if _same_path(output, args.input):
+                raise ValueError("output must not overwrite the input JSON")
+            data = json.loads(args.input.read_text(encoding="utf-8"))
+            result = analysis_result_from_dict(data)
+            if isinstance(result.settings.get("exports"), dict):
+                result.settings["exports"]["json"] = str(output)
+            # Create the destination before export validation checks its
+            # presence; the final schema is written again below.
+            write_json(output, result.to_dict())
+            recluster_result(
+                result,
+                reuse_level=args.reuse_level,
+                threshold=args.threshold,
+                spectral_threshold=args.spectral_threshold,
+                reexport=not args.no_reexport,
+            )
+            output_data = result.to_dict()
+            write_json(output, output_data)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(output_data if args.full_json else result.summary, ensure_ascii=False, indent=2))
         return 0
     if args.command != "analyze":
         return 2

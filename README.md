@@ -62,3 +62,18 @@ dist\bms-reuse.exe batch .\stems --recursive --output-dir .\batch-out --bpm 174 
 ```
 
 各入力のサブフォルダと`manifest.json`が生成され、壊れた入力があっても残りを継続します。
+
+## 解析後の再クラスタリング
+
+保存済みの比較レポートだけを使い、音声再解析・FFTなしで使い回し度を変更できます。
+
+```powershell
+dist\bms-reuse.exe recluster project.bra.json `
+  --output project.aggressive.bra.json --reuse-level aggressive
+```
+
+`--reuse-level` は `strict` / `balanced` / `aggressive` または `0.0`〜`1.0` の連続閾値です。`--threshold` と `--spectral-threshold` で個別指定もできます。既存のS/G/D/Iレビューは優先され、I除外はヒット・比較・クラスタ・イベント・代表WAV数に反映されます。
+
+GUIから呼ぶ最小APIは `bms_reuse.recluster_result(result, reuse_level="balanced")` です。同じ`AnalysisResult`を更新して返し、`result.plan.clusters`（代表1つ/クラスタ）、`result.plan.events`（非除外ヒット1件/イベント）、`result.summary`、`result.settings["exports"]`、`result.settings["recluster_thresholds"]`を同期します。`reexport=False`ならJSON/メタデータだけ更新します。
+
+schema v2 JSONには、`recluster.profile`、`recluster.thresholds`（waveform/spectral/gain_tolerance_db）、`review`、`exports`、`validation`が保存されます。再クラスタリングは保存された`comparisons`のスコアとヒットの`features`/座標だけをデータ契約として受け取ります。

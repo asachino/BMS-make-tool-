@@ -23,7 +23,8 @@ class Hit:
 
     @property
     def sample_count(self) -> int:
-        return int(self.samples.shape[0]) if np is not None else len(self.samples)
+        shape = getattr(self.samples, "shape", None)
+        return int(shape[0]) if shape is not None else len(self.samples)
 
     def to_dict(self, include_samples: bool = False) -> dict:
         data = {

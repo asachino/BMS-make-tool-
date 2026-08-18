@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bms_reuse.application import analyze_file
+from bms_reuse.application import AnalysisResult, analyze_file
 from bms_reuse.audio.loader import load_audio
 from bms_reuse.clustering.reuse_plan import Cluster, ReusePlan
 from bms_reuse.extraction.hit_extractor import Hit
@@ -211,6 +211,65 @@ class GuiSupportTest(unittest.TestCase):
             self.assertFalse(view.playback_pause_button.isEnabled())
             view.shutdown()
             view.close()
+
+    def test_waveform_stereo_zoom_and_pan_use_source_samples(self):
+        from bms_reuse.gui import WaveformView
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "stereo.wav"
+            samples = [[0.8 if index % 2 == 0 else -0.4, -0.7 if index % 3 == 0 else 0.2] for index in range(6000)]
+            write_wav(source, samples, 1000, channels=2)
+            view = WaveformView()
+            view.set_source_audio(source, load_audio(source))
+            self.assertTrue(view.waveform_points)
+            self.assertTrue(len(view.waveform_points[0]) >= 4)
+            view.zoom_slider.setValue(2)
+            self.assertEqual(view.zoom_slider.value(), 2)
+            self.assertFalse(view._follow_playhead)
+            view.pan_slider.setValue(5000)
+            self.assertFalse(view._follow_playhead)
+            view.resize(900, 230)
+            self.assertFalse(view.canvas.grab().isNull())
+            view.shutdown()
+            view.close()
+
+    def test_cluster_reuse_setting_reclusters_without_reanalysis(self):
+        from bms_reuse.gui import MainWindow
+        from bms_reuse.similarity.score import SimilarityReport
+
+        hits = [Hit(index, index, float(index), [0.0], index, index + 1) for index in range(3)]
+        reports = [
+            SimilarityReport(0, 1, 0.90, 0.90, 0.0, 0.90, 0.90, 0.90, 0.90, 0),
+            SimilarityReport(0, 2, 0.99, 0.99, 0.0, 0.99, 0.99, 0.99, 0.99, 0),
+        ]
+        plan = ReusePlan(
+            [Cluster(1, 0, [0, 1]), Cluster(2, 2, [2])],
+            [
+                {"hit": 0, "time": 0.0, "sample_id": "sample_001", "gain_db": 0.0},
+                {"hit": 1, "time": 1.0, "sample_id": "sample_001", "gain_db": 0.0},
+                {"hit": 2, "time": 2.0, "sample_id": "sample_002", "gain_db": 0.0},
+            ],
+        )
+        result = AnalysisResult(
+            "stem.wav",
+            1000,
+            3.0,
+            hits,
+            reports,
+            plan,
+            {"threshold": 0.95, "spectral_threshold": 0.94, "review_overrides": {}, "review_targets": {}, "excluded_hits": []},
+            "source-hash",
+        )
+        window = MainWindow()
+        self.assertFalse(window.cluster_box.isEnabled())
+        window._on_result(result, {})
+        self.assertTrue(window.cluster_box.isEnabled())
+        window.cluster_slider.setValue(90)
+        window._apply_cluster_threshold()
+        self.assertEqual([cluster.hit_ids for cluster in result.plan.clusters], [[0, 1, 2]])
+        self.assertEqual({event["sample_id"] for event in result.plan.events}, {"sample_001"})
+        self.assertEqual(result.settings["recluster_profile"], "custom")
+        window.close()
 
     def test_representative_wav_count_matches_clusters_and_gain_variants(self):
         with tempfile.TemporaryDirectory() as directory:
