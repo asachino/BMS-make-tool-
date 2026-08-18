@@ -1,8 +1,10 @@
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from bms_reuse.application import AnalysisResult, analyze_file
 from bms_reuse.audio.loader import load_audio
@@ -301,6 +303,242 @@ class GuiSupportTest(unittest.TestCase):
             self.assertEqual(len({path.name for path in paths}), len(plan.clusters))
             self.assertEqual(len(list(output.glob("sample_*.wav"))), len(plan.clusters))
             self.assertEqual([path.stem for path in paths], ["sample_001", "sample_002"])
+
+    def test_cut_plan_and_sound_review_controls(self):
+        from bms_reuse.gui import CUT_MODE_LABELS, MainWindow
+
+        window = MainWindow()
+        self.assertEqual(
+            {window.cut_mode_combo.itemData(index) for index in range(window.cut_mode_combo.count())},
+            set(CUT_MODE_LABELS),
+        )
+        window.bpm_spin.setValue(120.0)
+        window.cut_mode_combo.setCurrentIndex(window.cut_mode_combo.findData("manual"))
+        window.user_boundary_edit.setText("0.500, 1.000, 0.500, -1")
+        settings = window._settings()
+        self.assertEqual(settings["cut_plan"]["mode"], "manual")
+        self.assertEqual(settings["cut_plan"]["points"], [0.5, 1.0])
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "音種.wav"
+            signal = [0.0] * 1600
+            signal[100] = 1.0
+            signal[900] = 0.8
+            write_wav(source, signal, 1000)
+            result = analyze_file(source, min_separation_ms=300.0, window_ms=200.0)
+            window._on_result(result, {})
+            self.assertTrue(window.rows)
+            hit_id = window.rows[0]["id"]
+            window._select_hit(hit_id)
+            snare_index = window.hit_type_combo.findData("snare")
+            window.hit_type_combo.setCurrentIndex(snare_index)
+            window._apply_hit_type()
+            self.assertEqual(result.settings["hit_type_overrides"][str(hit_id)], "snare")
+            self.assertEqual(next(row for row in window.rows if row["id"] == hit_id)["sound_type"], "snare")
+            window._set_cut_override("excluded")
+            self.assertNotIn(hit_id, result.settings["active_hit_ids"])
+            self.assertEqual(next(row for row in window.rows if row["id"] == hit_id)["cut_state"], "除外")
+            window._set_cut_override("accepted")
+            self.assertIn(hit_id, result.settings["active_hit_ids"])
+        window.close()
+
+    def test_saved_json_restores_analysis_controls_and_pattern_units(self):
+        from bms_reuse.gui import MainWindow
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source = directory / "pattern.wav"
+            write_wav(source, [0.0] * 1200, 1000)
+            result = analyze_file(
+                source,
+                instrument="snare",
+                bpm=120.0,
+                beat_division=8,
+                margin=88.0,
+                min_interval_sec=(60.0 / 120.0) / 8.0 * 0.88,
+                cut_plan={"mode": "pattern", "pattern": [0.25, 0.375]},
+            )
+            result.settings.update({"time_signature": "3/4", "swing_percent": 62.0})
+            json_path = directory / "pattern.bra.json"
+            json_path.write_text(json.dumps(result.to_dict(), ensure_ascii=False), encoding="utf-8")
+            window = MainWindow()
+            with patch("bms_reuse.gui.QFileDialog.getOpenFileName", return_value=(str(json_path), "JSON")):
+                window._open_analysis_json()
+            self.assertIsNotNone(window.result)
+            self.assertEqual(window.instrument_combo.currentData(), "snare")
+            self.assertEqual(window.bpm_spin.value(), 120.0)
+            self.assertEqual(window.beat_division_combo.currentData(), 8)
+            self.assertEqual(window.margin_spin.value(), 88.0)
+            self.assertEqual(window.cut_mode_combo.currentData(), "pattern")
+            self.assertEqual(window.time_signature_combo.currentData(), "3/4")
+            self.assertEqual(window.swing_spin.value(), 62.0)
+            self.assertEqual(
+                [float(value) for value in window.user_boundary_edit.text().split(", ")],
+                [0.25, 0.375],
+            )
+            window.close()
+
+    def test_review_rebuild_syncs_plan_outputs_and_bmson_prefix(self):
+        from bms_reuse.gui import MainWindow
+        from bms_reuse.similarity.score import SimilarityReport
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source = directory / "review.wav"
+            write_wav(source, [[0.2], [0.3], [0.4], [0.5], [0.6], [0.7], [0.8], [0.9], [0.1], [0.2]], 1000)
+            audio = load_audio(source)
+            hits = [
+                Hit(1, 0, 0.0, audio.samples[0:3], 0, 3),
+                Hit(2, 3, 0.003, audio.samples[3:6], 3, 6),
+                Hit(3, 6, 0.006, audio.samples[6:9], 6, 9),
+            ]
+            reports = [
+                SimilarityReport(1, 2, 0.99, 0.99, 0.0, 0.99, 0.99, 0.99, 0.99, 0),
+                SimilarityReport(1, 3, 0.10, 0.10, 0.0, 0.10, 0.10, 0.10, 0.10, 0),
+            ]
+            plan = ReusePlan(
+                [Cluster(1, 1, [1, 2]), Cluster(2, 3, [3])],
+                [
+                    {"hit": 1, "time": 0.0, "sample_id": "sample_001", "gain_db": 0.0},
+                    {"hit": 2, "time": 0.003, "sample_id": "sample_001", "gain_db": 0.0},
+                    {"hit": 3, "time": 0.006, "sample_id": "sample_002", "gain_db": 0.0},
+                ],
+            )
+            samples_dir = directory / "samples"
+            exports = {
+                "json": str(directory / "review.bra.json"),
+                "samples_dir": str(samples_dir),
+                "samples": [],
+                "csv": str(directory / "review.csv"),
+                "bms": str(directory / "review.bms"),
+                "bmson": str(directory / "review.bmson"),
+            }
+            settings = {
+                "threshold": 0.95,
+                "spectral_threshold": 0.94,
+                "max_alignment_ms": 20.0,
+                "bpm": 120.0,
+                "offset": 0.0,
+                "subdivision": 16,
+                "bms_channel": "01",
+                "instrument": "kick",
+                "review_overrides": {},
+                "review_targets": {},
+                "excluded_hits": [],
+                "active_hit_ids": [1, 2, 3],
+                "exports": exports,
+                "fade_in_ms": 0.0,
+                "fade_out_ms": 0.0,
+                "similarity_profile": {"name": "waveform_spectral_v2"},
+                "recluster_profile": "balanced",
+                "recluster_thresholds": {"waveform": 0.95, "spectral": 0.94, "gain_tolerance_db": 0.25},
+            }
+            result = AnalysisResult(str(source), 1000, 0.01, hits, reports, plan, settings, "hash")
+            window = MainWindow()
+            window._on_result(result, dict(exports))
+            window._select_hit(2)
+            window.review_target_combo.setCurrentIndex(window.review_target_combo.findData(2))
+            window._apply_review("S")
+            self.assertEqual(result.settings["review_targets"]["2"], 2)
+            self.assertIn(2, next(cluster for cluster in result.plan.clusters if cluster.id == 2).hit_ids)
+            window._select_hit(2)
+            window.review_target_combo.setCurrentIndex(window.review_target_combo.findData(1))
+            window._apply_review("G")
+            self.assertEqual(result.settings["review_targets"]["2"], 1)
+            window._select_hit(2)
+            window._apply_review("D")
+            self.assertTrue(any(cluster.representative_hit == 2 and cluster.hit_ids == [2] for cluster in result.plan.clusters))
+            window._select_hit(2)
+            window._apply_review("I")
+            self.assertNotIn(2, result.settings["active_hit_ids"])
+            self.assertNotIn(2, {int(event["hit"]) for event in result.plan.events})
+            window._select_hit(2)
+            window._apply_review("I")
+            self.assertIn(2, result.settings["active_hit_ids"])
+            self.assertIn(2, {int(event["hit"]) for event in result.plan.events})
+            window._select_hit(1)
+            window.hit_type_combo.setCurrentIndex(window.hit_type_combo.findData("snare"))
+            window._apply_hit_type()
+            self.assertEqual(result.hits[0].instrument, "snare")
+            self.assertTrue(Path(exports["json"]).exists())
+            self.assertTrue(Path(exports["bms"]).exists())
+            self.assertTrue(Path(exports["bmson"]).exists())
+            self.assertEqual(result.settings["validation"].get("ok"), True)
+            bmson = json.loads(Path(exports["bmson"]).read_text(encoding="utf-8"))
+            self.assertTrue(all(Path(sample["name"]).name.startswith("sample_") for sample in bmson["sound_samples"]))
+            self.assertTrue(all("samples/" in sample["name"] for sample in bmson["sound_samples"]))
+            window.close()
+
+    def test_ignore_then_accept_cut_keeps_review_exclusion_synced(self):
+        from bms_reuse.gui import MainWindow
+        from bms_reuse.similarity.score import SimilarityReport
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source = directory / "ignore-then-accept.wav"
+            write_wav(source, [[0.2], [0.3], [0.4], [0.5], [0.6], [0.7]], 1000)
+            audio = load_audio(source)
+            hits = [
+                Hit(1, 0, 0.0, audio.samples[0:3], 0, 3),
+                Hit(2, 3, 0.003, audio.samples[3:6], 3, 6),
+            ]
+            reports = [SimilarityReport(1, 2, 0.99, 0.99, 0.0, 0.99, 0.99, 0.99, 0.99, 0)]
+            plan = ReusePlan(
+                [Cluster(1, 1, [1, 2])],
+                [
+                    {"hit": 1, "time": 0.0, "sample_id": "sample_001", "gain_db": 0.0},
+                    {"hit": 2, "time": 0.003, "sample_id": "sample_001", "gain_db": 0.0},
+                ],
+            )
+            samples_dir = directory / "samples"
+            exports = {
+                "json": str(directory / "ignore-then-accept.bra.json"),
+                "samples_dir": str(samples_dir),
+                "samples": [],
+                "csv": str(directory / "ignore-then-accept.csv"),
+                "bms": str(directory / "ignore-then-accept.bms"),
+                "bmson": str(directory / "ignore-then-accept.bmson"),
+            }
+            result = AnalysisResult(
+                str(source),
+                1000,
+                0.006,
+                hits,
+                reports,
+                plan,
+                {
+                    "threshold": 0.95,
+                    "spectral_threshold": 0.94,
+                    "review_overrides": {},
+                    "review_targets": {},
+                    "excluded_hits": [],
+                    "active_hit_ids": [1, 2],
+                    "exports": exports,
+                    "bpm": 120.0,
+                    "offset": 0.0,
+                    "subdivision": 16,
+                    "bms_channel": "01",
+                },
+                "ignore-then-accept-hash",
+            )
+            window = MainWindow()
+            window._on_result(result, dict(exports))
+
+            window._select_hit(2)
+            window._apply_review("I")
+            window._select_hit(2)
+            window._set_cut_override("accepted")
+
+            self.assertEqual(result.settings["review_overrides"]["2"], "I")
+            self.assertEqual(result.settings["cut_overrides"]["2"], "accepted")
+            self.assertNotIn(2, result.settings["active_hit_ids"])
+            self.assertNotIn(2, {int(event["hit"]) for event in result.plan.events})
+            self.assertTrue(all(2 not in cluster.hit_ids for cluster in result.plan.clusters))
+            synced_exports = result.settings["exports"]
+            self.assertEqual(len(synced_exports["samples"]), len(result.plan.clusters))
+            self.assertTrue(all(Path(path).exists() for path in synced_exports["samples"]))
+            self.assertTrue(result.settings["validation"].get("ok"), result.settings["validation"])
+            window.close()
 
 
 if __name__ == "__main__":

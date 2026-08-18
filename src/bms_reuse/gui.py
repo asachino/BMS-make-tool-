@@ -6,6 +6,7 @@ presentation, export orchestration, and the cancellation boundary.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -52,18 +53,25 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised by the CLI-only install
     raise RuntimeError("GUI requires PySide6. Install with: pip install .[gui]") from exc
 
-from .application import AnalysisCancelled, AnalysisResult, analyze_file, exclude_hit, recluster_result, record_output_timing, refresh_reproducibility
+from .application import (
+    AnalysisCancelled,
+    AnalysisResult,
+    analysis_result_from_dict,
+    analyze_file,
+    recluster_result,
+    record_output_timing,
+    relative_sample_prefix_for_export,
+)
 from .batch import run_batch
 from ._numeric import np
 from .audio.loader import load_audio, mono_signal
 from .export.csv_exporter import write_hits_csv
 from .export.json_exporter import write_json
 from .export.wav_exporter import write_hit_wavs
-from .export.bms_exporter import relative_sample_prefix, write_bms
+from .export.bms_exporter import write_bms
 from .export.bmson_exporter import write_bmson
 from .export.quality import validate_exports
 from .project.presets import load_preset, save_preset
-from .clustering.reuse_plan import Cluster
 
 
 APP_NAME = "StemReuse"
@@ -107,6 +115,30 @@ INSTRUMENT_LABELS = {
     "clap": "クラップ",
     "hihat": "ハイハット",
     "other": "その他",
+}
+
+CUT_MODE_LABELS = {
+    "auto": "トランジェント優先",
+    "grid": "等間隔グリッド",
+    "manual": "ユーザー境界",
+    "pattern": "ハイブリッド",
+}
+
+CUT_MODE_ALIASES = {"transient": "auto", "hybrid": "pattern"}
+
+TIME_SIGNATURE_LABELS = {
+    "4/4": "4/4",
+    "3/4": "3/4",
+    "6/8": "6/8",
+}
+
+GUI_ONLY_SETTING_KEYS = {
+    "loop_cut_mode",
+    "time_signature",
+    "swing_percent",
+    "user_boundaries",
+    "hit_type_overrides",
+    "cut_overrides",
 }
 
 
@@ -239,6 +271,68 @@ def format_seconds(value: float) -> str:
     return f"{int(minutes):02d}:{seconds:05.2f}"
 
 
+def _parse_user_boundaries(value) -> list[float]:
+    if isinstance(value, str):
+        values = value.replace("、", ",").split(",")
+    elif isinstance(value, (list, tuple)):
+        values = value
+    else:
+        return []
+    boundaries: list[float] = []
+    for raw in values:
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if number >= 0.0:
+            boundaries.append(number)
+    return sorted(set(boundaries))
+
+
+def _canonical_cut_mode(value) -> str:
+    key = str(value or "auto").strip().casefold()
+    key = CUT_MODE_ALIASES.get(key, key)
+    return key if key in CUT_MODE_LABELS else "auto"
+
+
+def _event_flags(result: AnalysisResult, index: int, hit, report) -> str:
+    flags: list[str] = []
+    settings = result.settings if isinstance(result.settings, dict) else {}
+    if index:
+        try:
+            bpm = float(settings.get("bpm") or 0.0)
+            subdivision = max(1, int(settings.get("subdivision", 16)))
+            delta = float(hit.time) - float(result.hits[index - 1].time)
+            grid_step = (60.0 / bpm) / subdivision if bpm > 0 else 0.0
+            if grid_step > 0:
+                nearest = max(1, round(delta / grid_step))
+                if abs(delta - nearest * grid_step) > grid_step * 0.25:
+                    flags.append("変則")
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    if report:
+        try:
+            gain_changed = abs(float(report.gain_db)) >= 0.1
+        except (TypeError, ValueError):
+            gain_changed = False
+        if report.classification == "GAIN_VARIANT" or gain_changed:
+            flags.append("音量変化")
+    automation = getattr(hit, "automation", {}) or {}
+    automation_flags = automation.get("flags", []) if isinstance(automation, dict) else []
+    automation_variations = automation.get("variations", []) if isinstance(automation, dict) else []
+    if automation_flags or automation_variations:
+        labels = {"OFF_GRID": "変則", "VOLUME_CHANGE": "音量変化", "TIMBRE_CHANGE": "音色変化", "PAN_CHANGE": "定位変化"}
+        for value in [*automation_flags, *automation_variations]:
+            label = labels.get(str(value).upper(), "オートメーション")
+            if label not in flags:
+                flags.append(label)
+    # Keep compatibility with older serialized results that only recorded IDs.
+    automation_ids = settings.get("automation_changes", [])
+    if isinstance(automation_ids, (list, tuple, set)) and str(hit.id) in {str(value) for value in automation_ids}:
+        flags.append("オートメーション")
+    return "・".join(dict.fromkeys(flags))
+
+
 def classify_hits(result: AnalysisResult) -> list[dict]:
     """Flatten the core result into rows suitable for a review table."""
     report_by_hit = {report.candidate_id: report for report in result.comparisons}
@@ -254,12 +348,23 @@ def classify_hits(result: AnalysisResult) -> list[dict]:
     }
     rows: list[dict] = []
     overrides = result.settings.get("review_overrides", {}) if isinstance(result.settings, dict) else {}
-    for hit in result.hits:
+    type_overrides = result.settings.get("hit_type_overrides", {}) if isinstance(result.settings, dict) else {}
+    type_overrides = type_overrides if isinstance(type_overrides, dict) else {}
+    default_type = result.settings.get("instrument", "other") if isinstance(result.settings, dict) else "other"
+    if default_type not in INSTRUMENT_LABELS:
+        default_type = "other"
+    for index, hit in enumerate(result.hits):
         report = report_by_hit.get(hit.id)
         classification = report.classification if report else "BASE"
         override = overrides.get(str(hit.id)) if isinstance(overrides, dict) else None
         if override:
             classification = "IGNORED" if override == "I" else {"S": "SAME", "G": "GAIN_VARIANT", "D": "DIFFERENT"}.get(override, override)
+        sound_type = type_overrides.get(str(hit.id), getattr(hit, "instrument", default_type))
+        if sound_type not in INSTRUMENT_LABELS:
+            sound_type = "other"
+        cut_overrides = result.settings.get("cut_overrides", {}) if isinstance(result.settings, dict) else {}
+        cut_state = cut_overrides.get(str(hit.id), "") if isinstance(cut_overrides, dict) else ""
+        cut_state = {"accepted": "採用", "excluded": "除外"}.get(str(cut_state), "")
         rows.append(
             {
                 "id": hit.id,
@@ -279,6 +384,12 @@ def classify_hits(result: AnalysisResult) -> list[dict]:
                 "start": hit.source_start / max(1, result.sample_rate),
                 "end": hit.source_end / max(1, result.sample_rate),
                 "review_override": override,
+                "sound_type": sound_type,
+                "event_flags": _event_flags(result, index, hit, report),
+                "variation_flags": list((getattr(hit, "automation", {}) or {}).get("variations", []))
+                if isinstance(getattr(hit, "automation", {}) or {}, dict)
+                else [],
+                "cut_state": cut_state,
             }
         )
     return rows
@@ -320,12 +431,27 @@ class AnalysisWorker(QThread):
 
     def run(self) -> None:  # noqa: D401 - Qt thread entry point
         try:
+            analysis_settings = {
+                key: value for key, value in self.settings.items() if key not in GUI_ONLY_SETTING_KEYS
+            }
             result = analyze_file(
                 self.input_path,
                 progress=self._on_progress,
                 is_cancelled=self.cancel_event.is_set,
-                **self.settings,
+                **analysis_settings,
             )
+            result.settings.update(
+                {
+                    key: self.settings[key]
+                    for key in GUI_ONLY_SETTING_KEYS
+                    if key in self.settings
+                }
+            )
+            if isinstance(self.settings.get("cut_plan"), dict):
+                merged_cut_plan = dict(result.settings.get("cut_plan", {}) or {})
+                merged_cut_plan.update(self.settings["cut_plan"])
+                result.settings["cut_plan"] = merged_cut_plan
+            result.settings.setdefault("active_hit_ids", [int(hit.id) for hit in result.hits])
             if self.cancel_event.is_set():
                 raise AnalysisCancelled()
             exported: dict[str, object] = {}
@@ -365,7 +491,7 @@ class AnalysisWorker(QThread):
                     offset=float(self.settings.get("offset", 0.0)),
                     subdivision=int(self.settings.get("subdivision", 16)),
                     channel=str(self.settings.get("bms_channel", "01")),
-                    wav_prefix=relative_sample_prefix(bms_path, self.outputs.get("samples")),
+                    wav_prefix=relative_sample_prefix_for_export(bms_path, self.outputs.get("samples")),
                 ))
             bmson_path = self.outputs.get("bmson")
             if bmson_path:
@@ -374,6 +500,7 @@ class AnalysisWorker(QThread):
                     result.plan,
                     bpm=self.settings.get("bpm"),
                     offset=float(self.settings.get("offset", 0.0)),
+                    wav_prefix=relative_sample_prefix_for_export(bmson_path, self.outputs.get("samples")),
                 ))
             exported["validation"] = validate_exports(result, exported)
             result.settings["validation"] = exported["validation"]
@@ -404,6 +531,9 @@ class BatchWorker(QThread):
 
     def run(self) -> None:
         try:
+            analysis_settings = {
+                key: value for key, value in self.settings.items() if key not in GUI_ONLY_SETTING_KEYS
+            }
             manifest = run_batch(
                 self.folder,
                 output_dir=self.output_dir,
@@ -411,7 +541,7 @@ class BatchWorker(QThread):
                 progress=lambda percent, message: self.progress.emit(percent, message),
                 export_bms=True,
                 export_bmson=True,
-                **self.settings,
+                **analysis_settings,
             )
             self.result_ready.emit(manifest)
         except Exception:
@@ -535,10 +665,11 @@ class PlaybackSegmentWorker(QThread):
     ready = Signal(str, float)
     failed = Signal(str)
 
-    def __init__(self, source_path: Path, start_seconds: float, parent: QObject | None = None):
+    def __init__(self, source_path: Path, start_seconds: float, end_seconds: float | None = None, parent: QObject | None = None):
         super().__init__(parent)
         self.source_path = source_path
         self.start_seconds = max(0.0, float(start_seconds))
+        self.end_seconds = None if end_seconds is None else max(self.start_seconds, float(end_seconds))
 
     def run(self) -> None:
         target_path: Path | None = None
@@ -546,6 +677,9 @@ class PlaybackSegmentWorker(QThread):
             with wave.open(str(self.source_path), "rb") as source:
                 rate = source.getframerate()
                 start_frame = min(source.getnframes(), round(self.start_seconds * rate))
+                end_frame = source.getnframes() if self.end_seconds is None else min(
+                    source.getnframes(), max(start_frame, round(self.end_seconds * rate))
+                )
                 source.setpos(start_frame)
                 handle = tempfile.NamedTemporaryFile(prefix="bms-reuse-preview-", suffix=".wav", delete=False)
                 target_path = Path(handle.name)
@@ -553,7 +687,10 @@ class PlaybackSegmentWorker(QThread):
                 with wave.open(str(target_path), "wb") as target:
                     target.setparams(source.getparams())
                     while not self.isInterruptionRequested():
-                        chunk = source.readframes(65536)
+                        remaining = end_frame - source.tell()
+                        if remaining <= 0:
+                            break
+                        chunk = source.readframes(min(65536, remaining))
                         if not chunk:
                             break
                         target.writeframesraw(chunk)
@@ -616,20 +753,26 @@ class WaveformCanvas(QWidget):
             painter.setPen(QPen(QColor("#9da1a4"), 1))
 
         # Thin musical grid lines sit behind the real source waveform.
-        if owner.bpm and owner.bpm > 0:
+        if owner.bpm and owner.bpm > 0 and owner.cut_mode in {"grid", "pattern"}:
             beat_step = 60.0 / owner.bpm / max(1, owner.subdivision)
             grid_step = beat_step
             grid_limit = max(64, rect.width() // 8)
             while visible / max(grid_step, 1e-9) > grid_limit:
                 grid_step *= 2.0
             grid_time = owner.offset + max(0, int((start - owner.offset) / grid_step) - 1) * grid_step
+            try:
+                beats_per_bar = max(1, int(str(owner.time_signature).split("/", 1)[0]))
+            except (TypeError, ValueError):
+                beats_per_bar = 4
             while grid_time <= end + grid_step:
                 if grid_time >= start:
-                    fraction = (grid_time - start) / max(visible, 1e-9)
-                    x = rect.left() + round(fraction * rect.width())
                     beat_index = round((grid_time - owner.offset) / beat_step)
-                    if beat_index % (owner.subdivision * 4) == 0:
-                        color, width, label = QColor("#777d82"), 2, f"小節{beat_index // (owner.subdivision * 4) + 1}"
+                    swing = max(0.0, min(0.25, (float(owner.swing_percent) - 50.0) / 100.0))
+                    display_time = grid_time + (beat_step * swing if beat_index % 2 else 0.0)
+                    fraction = (display_time - start) / max(visible, 1e-9)
+                    x = rect.left() + round(fraction * rect.width())
+                    if beat_index % (owner.subdivision * beats_per_bar) == 0:
+                        color, width, label = QColor("#777d82"), 2, f"小節{beat_index // (owner.subdivision * beats_per_bar) + 1}"
                     elif beat_index % owner.subdivision == 0:
                         color, width, label = QColor("#8f9599"), 1, "拍"
                     else:
@@ -640,6 +783,33 @@ class WaveformCanvas(QWidget):
                         painter.setPen(color)
                         painter.drawText(x + 3, rect.top() + 13, label)
                 grid_time += grid_step
+
+        if owner.cut_mode in {"auto", "pattern"}:
+            last_transient_x = rect.left() - 80
+            for row in owner.rows:
+                marker_time = float(row["time"])
+                if marker_time < start or marker_time > end:
+                    continue
+                x = rect.left() + round((marker_time - start) / max(visible, 1e-9) * rect.width())
+                painter.setPen(QPen(QColor("#596168"), 1, Qt.DashLine))
+                painter.drawLine(x, rect.top(), x, rect.bottom())
+                if x - last_transient_x >= 80:
+                    painter.setPen(QColor("#596168"))
+                    painter.drawText(x + 3, rect.bottom() - 4, "トランジェント")
+                    last_transient_x = x
+
+        if owner.cut_mode == "manual":
+            last_boundary_x = rect.left() - 80
+            for boundary in owner.user_boundaries:
+                if boundary < start or boundary > end:
+                    continue
+                x = rect.left() + round((boundary - start) / max(visible, 1e-9) * rect.width())
+                painter.setPen(QPen(QColor("#394149"), 2, Qt.DashDotLine))
+                painter.drawLine(x, rect.top(), x, rect.bottom())
+                if x - last_boundary_x >= 80:
+                    painter.setPen(QColor("#394149"))
+                    painter.drawText(x + 3, rect.bottom() - 4, "境界")
+                    last_boundary_x = x
 
         points = owner.waveform_points
         stereo = bool(points and len(points[0]) >= 4)
@@ -743,6 +913,10 @@ class WaveformView(QWidget):
         self.bpm: float | None = None
         self.offset = 0.0
         self.subdivision = 16
+        self.cut_mode = "grid"
+        self.time_signature = "4/4"
+        self.swing_percent = 50.0
+        self.user_boundaries: list[float] = []
         self.position = 0.0
         self.rows: list[dict] = []
         self.selected_id: int | None = None
@@ -755,8 +929,10 @@ class WaveformView(QWidget):
         self._playing = False
         self._playback_started_at = 0.0
         self._playback_offset = 0.0
+        self._playback_end: float | None = None
         self._segment_path: Path | None = None
         self._pending_start: float | None = None
+        self._pending_end: float | None = None
         self._preview_worker: PreviewLoadWorker | None = None
         self._playback_worker: PlaybackSegmentWorker | None = None
         self._slider_dragging = False
@@ -980,6 +1156,17 @@ class WaveformView(QWidget):
             self.bpm = result.settings.get("bpm")
             self.offset = float(result.settings.get("offset", 0.0) or 0.0)
             self.subdivision = int(result.settings.get("subdivision", 16) or 16)
+            cut_plan = result.settings.get("cut_plan", {}) if isinstance(result.settings, dict) else {}
+            cut_plan = cut_plan if isinstance(cut_plan, dict) else {}
+            self.cut_mode = _canonical_cut_mode(cut_plan.get("mode", result.settings.get("loop_cut_mode", "auto")))
+            self.time_signature = str(cut_plan.get("time_signature", result.settings.get("time_signature", "4/4")))
+            self.swing_percent = float(cut_plan.get("swing_percent", result.settings.get("swing_percent", 50.0)) or 50.0)
+            self.user_boundaries = _parse_user_boundaries(
+                result.settings.get(
+                    "user_boundaries",
+                    cut_plan.get("boundaries_sec", result.settings.get("loop_boundaries_sec", [])),
+                )
+            )
             self._follow_playhead = True
             self.selected_id = self.rows[0]["id"] if self.rows else None
             legend = self._marker_legend_html()
@@ -1006,7 +1193,7 @@ class WaveformView(QWidget):
             self._segment_path.unlink(missing_ok=True)
             self._segment_path = None
 
-    def _start_native(self, path: Path, start: float) -> None:
+    def _start_native(self, path: Path, start: float, end: float | None = None) -> None:
         if sys.platform != "win32":
             self.playback_hint_label.setText("この環境では元WAVの再生に対応していません")
             return
@@ -1018,25 +1205,29 @@ class WaveformView(QWidget):
             self.playback_status.emit(f"再生エラー: {exc}")
             return
         self._playback_offset = start
+        self._playback_end = end if end is not None else self.duration
         self._playback_started_at = time.monotonic()
         self._playing = True
         self.playback_timer.start()
         self.playback_hint_label.setText("元WAVを再生中 · クリックまたはスライダーでシーク")
         self._update_controls()
 
-    def _play_from(self, start: float) -> None:
+    def _play_from(self, start: float, end: float | None = None) -> None:
         if not self.source_path or self.duration <= 0:
             return
         start = max(0.0, min(float(start), self.duration))
+        if end is not None:
+            end = max(start + 0.01, min(float(end), self.duration))
         if start >= self.duration - 0.01:
             start = 0.0
         self._native_stop()
         self._cleanup_segment()
-        if start <= 0.001:
+        if start <= 0.001 and end is None:
             self._start_native(self.source_path, 0.0)
             return
         self._pending_start = start
-        worker = PlaybackSegmentWorker(self.source_path, start, self)
+        self._pending_end = end
+        worker = PlaybackSegmentWorker(self.source_path, start, end, self)
         worker.ready.connect(self._segment_ready)
         worker.failed.connect(lambda message: self.playback_status.emit(f"再生準備エラー: {message}"))
         self._playback_worker = worker
@@ -1047,15 +1238,25 @@ class WaveformView(QWidget):
         if self._pending_start is None or abs(self._pending_start - start) > 1e-6:
             Path(path).unlink(missing_ok=True)
             return
+        end = self._pending_end
         self._pending_start = None
+        self._pending_end = None
         self._segment_path = Path(path)
-        self._start_native(self._segment_path, start)
+        self._start_native(self._segment_path, start, end)
 
     def play_playback(self) -> None:
         if self._playing:
             return
         self._follow_playhead = True
         self._play_from(self.position)
+
+    def play_range(self, start: float, end: float) -> None:
+        """Preview one extracted hit without playing the rest of the stem."""
+        if self._playing:
+            self.stop_playback()
+        self._follow_playhead = True
+        self._set_position(start)
+        self._play_from(start, end)
 
     def pause_playback(self) -> None:
         if not self._playing:
@@ -1072,6 +1273,8 @@ class WaveformView(QWidget):
         if self._playback_worker and self._playback_worker.isRunning():
             self._playback_worker.requestInterruption()
         self._pending_start = None
+        self._pending_end = None
+        self._playback_end = None
         self._native_stop()
         self._playing = False
         self.playback_timer.stop()
@@ -1085,12 +1288,13 @@ class WaveformView(QWidget):
         if not self._playing:
             return
         current = self._playback_offset + time.monotonic() - self._playback_started_at
-        if current >= self.duration:
+        playback_end = self._playback_end or self.duration
+        if current >= playback_end:
             self._native_stop()
             self._playing = False
             self.playback_timer.stop()
             self._cleanup_segment()
-            self._set_position(self.duration)
+            self._set_position(playback_end)
             self.playback_hint_label.setText("再生完了")
             return
         self._set_position(current)
@@ -1143,6 +1347,7 @@ class MainWindow(QMainWindow):
         self.result: AnalysisResult | None = None
         self.rows: list[dict] = []
         self.exported: dict[str, object] = {}
+        self._active_hit_id: int | None = None
         self._last_progress_message = ""
         self._processing_stage = "待機中"
         self._analysis_started_at: float | None = None
@@ -1160,6 +1365,7 @@ class MainWindow(QMainWindow):
             self.set_input_path(initial_path)
         self._set_running(False)
         self._on_bpm_changed()
+        self._on_cut_settings_changed()
         self._log("準備完了。WAVステムをドロップするか、Ctrl+Oで選択してください。")
 
     def _build_ui(self) -> None:
@@ -1191,6 +1397,11 @@ class MainWindow(QMainWindow):
         open_button.setToolTip("解析するPCM WAVステムを選択（Ctrl+O）")
         open_button.clicked.connect(self._browse_input)
         header.addWidget(open_button)
+        self.analysis_open_button = QPushButton("解析JSONを開く")
+        self.analysis_open_button.setAccessibleName("保存済み解析JSONを開く")
+        self.analysis_open_button.setToolTip("保存済みの解析結果とレビュー状態を再開")
+        self.analysis_open_button.clicked.connect(self._open_analysis_json)
+        header.addWidget(self.analysis_open_button)
         preset_load_button = QPushButton("設定読込")
         preset_load_button.clicked.connect(self._load_preset)
         header.addWidget(preset_load_button)
@@ -1307,6 +1518,47 @@ class MainWindow(QMainWindow):
         add_setting_row("比較モード", self.fast_compare_check)
         add_setting_row("BMSチャンネル", self.bms_channel_combo)
         left_layout.addWidget(settings_box)
+
+        cut_box = QGroupBox("音切り補助")
+        cut_form = QFormLayout(cut_box)
+        cut_form.setContentsMargins(0, 4, 0, 0)
+        cut_form.setHorizontalSpacing(12)
+        cut_form.setVerticalSpacing(7)
+        cut_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        self.cut_mode_combo = QComboBox()
+        for key, label in CUT_MODE_LABELS.items():
+            self.cut_mode_combo.addItem(label, key)
+        self.cut_mode_combo.setToolTip("音切り候補の基準線を選択")
+        self.time_signature_combo = QComboBox()
+        for key, label in TIME_SIGNATURE_LABELS.items():
+            self.time_signature_combo.addItem(label, key)
+        self.time_signature_combo.setToolTip("拍子を波形グリッドと候補表示に反映")
+        self.swing_spin = self._double_spin(50.0, 50.0, 75.0, 1.0, 0, " %")
+        self.swing_spin.setToolTip("裏拍の長さ。50%は均等、値を上げると跳ねます")
+        self.user_boundary_edit = QLineEdit()
+        self.user_boundary_edit.setPlaceholderText("例: 0.500, 1.000, 1.500")
+        self.user_boundary_edit.setToolTip("秒単位の境界をカンマ区切りで入力")
+        self.user_boundary_apply = QPushButton("境界を反映")
+        self.user_boundary_apply.setToolTip("入力したユーザー境界を波形へ表示")
+        self.user_boundary_apply.clicked.connect(self._apply_user_boundaries)
+        boundary_row = QWidget()
+        boundary_layout = QHBoxLayout(boundary_row)
+        boundary_layout.setContentsMargins(0, 0, 0, 0)
+        boundary_layout.setSpacing(6)
+        boundary_layout.addWidget(self.user_boundary_edit, 1)
+        boundary_layout.addWidget(self.user_boundary_apply)
+        cut_form.addRow("切断モード", self.cut_mode_combo)
+        cut_form.addRow("拍子", self.time_signature_combo)
+        cut_form.addRow("スイング", self.swing_spin)
+        cut_form.addRow("ユーザー境界(s)", boundary_row)
+        self.cut_status_label = QLabel("解析後に候補を表示")
+        self.cut_status_label.setObjectName("Subtle")
+        self.cut_status_label.setWordWrap(True)
+        cut_form.addRow("状態", self.cut_status_label)
+        self.cut_mode_combo.currentIndexChanged.connect(self._on_cut_settings_changed)
+        self.time_signature_combo.currentIndexChanged.connect(self._on_cut_settings_changed)
+        self.swing_spin.valueChanged.connect(self._on_cut_settings_changed)
+        left_layout.addWidget(cut_box)
 
         self.cluster_box = QGroupBox("使い回し度")
         cluster_form = QFormLayout(self.cluster_box)
@@ -1434,6 +1686,13 @@ class MainWindow(QMainWindow):
             self.filter_combo.addItem(label, key)
         self.filter_combo.currentIndexChanged.connect(self._refresh_table)
         filter_row.addWidget(self.filter_combo)
+        self.sound_filter_combo = QComboBox()
+        self.sound_filter_combo.addItem("音種: すべて", "All")
+        for key, label in INSTRUMENT_LABELS.items():
+            self.sound_filter_combo.addItem(label, key)
+        self.sound_filter_combo.setToolTip("音種でヒットを絞り込み")
+        self.sound_filter_combo.currentIndexChanged.connect(self._refresh_table)
+        filter_row.addWidget(self.sound_filter_combo)
         self.next_review_button = QPushButton("次の要確認")
         self.next_review_button.setToolTip("判定保留・音の重なりを順番に確認")
         self.next_review_button.clicked.connect(self._select_next_review)
@@ -1446,8 +1705,8 @@ class MainWindow(QMainWindow):
         self.open_folder_button.clicked.connect(self._open_samples_folder)
         filter_row.addWidget(self.open_folder_button)
         table_layout.addLayout(filter_row)
-        self.hit_table = QTableWidget(0, 7)
-        self.hit_table.setHorizontalHeaderLabels(["番号", "時刻", "分類", "信頼度", "音量差", "サンプル", "注意"])
+        self.hit_table = QTableWidget(0, 9)
+        self.hit_table.setHorizontalHeaderLabels(["番号", "時刻", "分類", "信頼度", "音量差", "サンプル", "注意", "音種", "状態"])
         self.hit_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.hit_table.setSelectionMode(QTableWidget.SingleSelection)
         self.hit_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1472,6 +1731,45 @@ class MainWindow(QMainWindow):
         self.detail_metrics.setWordWrap(True)
         detail_box.addWidget(self.detail_title)
         detail_box.addWidget(self.detail_metrics)
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("音種"))
+        self.hit_type_combo = QComboBox()
+        for key, label in INSTRUMENT_LABELS.items():
+            self.hit_type_combo.addItem(label, key)
+        self.hit_type_combo.setEnabled(False)
+        self.hit_type_combo.setAccessibleName("選択ヒットの音種")
+        self.hit_type_combo.setToolTip("選択ヒットだけ音種を手動修正")
+        type_row.addWidget(self.hit_type_combo)
+        self.hit_type_apply_button = QPushButton("音種を適用")
+        self.hit_type_apply_button.setEnabled(False)
+        self.hit_type_apply_button.clicked.connect(self._apply_hit_type)
+        type_row.addWidget(self.hit_type_apply_button)
+        detail_box.addLayout(type_row)
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("S/G対象"))
+        self.review_target_combo = QComboBox()
+        self.review_target_combo.addItem("推奨（現在のクラスタ）", None)
+        self.review_target_combo.setEnabled(False)
+        self.review_target_combo.setAccessibleName("S/Gレビュー対象クラスタ")
+        self.review_target_combo.setToolTip("S/G判定を適用するクラスタ。未選択時は推奨候補")
+        target_row.addWidget(self.review_target_combo, 1)
+        detail_box.addLayout(target_row)
+        cut_action_row = QHBoxLayout()
+        self.preview_cut_button = QPushButton("切断をプレビュー")
+        self.preview_cut_button.setEnabled(False)
+        self.preview_cut_button.setToolTip("選択ヒットの境界から元WAVを再生")
+        self.preview_cut_button.clicked.connect(self._preview_selected_cut)
+        self.accept_cut_button = QPushButton("切断を採用")
+        self.accept_cut_button.setEnabled(False)
+        self.accept_cut_button.clicked.connect(lambda: self._set_cut_override("accepted"))
+        self.exclude_cut_button = QPushButton("切断を除外")
+        self.exclude_cut_button.setObjectName("Danger")
+        self.exclude_cut_button.setEnabled(False)
+        self.exclude_cut_button.clicked.connect(lambda: self._set_cut_override("excluded"))
+        cut_action_row.addWidget(self.preview_cut_button)
+        cut_action_row.addWidget(self.accept_cut_button)
+        cut_action_row.addWidget(self.exclude_cut_button)
+        detail_box.addLayout(cut_action_row)
         detail_box.addStretch(1)
         detail_layout.addLayout(detail_box, 2)
         sample_box = QVBoxLayout()
@@ -1576,6 +1874,8 @@ class MainWindow(QMainWindow):
         self.drop_zone.hint.setText("PCM WAV準備完了 · Ctrl+Enterで解析")
         self.result = None
         self.rows = []
+        self._active_hit_id = None
+        self._set_selection_actions(False)
         self.waveform.set_source_path(path)
         if hasattr(self, "hit_table"):
             self.hit_table.setRowCount(0)
@@ -1599,6 +1899,124 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "解析JSONの保存先", current, "BMS解析 (*.bra.json);;JSON (*.json)")
         if path:
             self.json_edit.setText(path)
+
+    def _restore_result_settings(self, result: AnalysisResult, data: dict) -> None:
+        """Restore analysis controls before a saved project is rendered."""
+        settings = result.settings
+        metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        grid = metadata.get("grid", {})
+        grid = grid if isinstance(grid, dict) else {}
+        for key in ("bpm", "offset", "subdivision", "beat_division", "margin_percent", "min_interval_sec"):
+            if key not in settings and key in grid:
+                settings[key] = grid[key]
+        if "instrument" not in settings and metadata.get("instrument"):
+            settings["instrument"] = metadata["instrument"]
+        if "cut_plan" not in settings and isinstance(metadata.get("cut_plan"), dict):
+            settings["cut_plan"] = dict(metadata["cut_plan"])
+
+        def set_value(widget, key: str, cast=float) -> None:
+            value = settings.get(key)
+            if value is None:
+                return
+            try:
+                widget.setValue(cast(value))
+            except (TypeError, ValueError):
+                return
+
+        set_value(self.bpm_spin, "bpm")
+        set_value(self.offset_spin, "offset")
+        set_value(self.subdivision_spin, "subdivision", int)
+        set_value(self.margin_spin, "margin_percent")
+        set_value(self.fade_in_spin, "fade_in_ms")
+        set_value(self.fade_out_spin, "fade_out_ms")
+        set_value(self.threshold_spin, "threshold")
+        set_value(self.spectral_spin, "spectral_threshold")
+        set_value(self.onset_spin, "onset_threshold")
+        set_value(self.pre_roll_spin, "pre_roll_ms")
+        set_value(self.window_spin, "window_ms")
+        set_value(self.alignment_spin, "max_alignment_ms")
+        instrument_index = self.instrument_combo.findData(settings.get("instrument", "kick"))
+        if instrument_index >= 0:
+            self.instrument_combo.setCurrentIndex(instrument_index)
+        division_index = self.beat_division_combo.findData(settings.get("beat_division"))
+        if division_index >= 0:
+            self.beat_division_combo.setCurrentIndex(division_index)
+        self.fast_compare_check.setChecked(bool(settings.get("fast_compare", False)))
+        channel_index = self.bms_channel_combo.findData(settings.get("bms_channel", "01"))
+        if channel_index >= 0:
+            self.bms_channel_combo.setCurrentIndex(channel_index)
+
+        cut_plan = settings.get("cut_plan", {})
+        cut_plan = cut_plan if isinstance(cut_plan, dict) else {}
+        mode = _canonical_cut_mode(cut_plan.get("mode", settings.get("loop_cut_mode", "auto")))
+        mode_index = self.cut_mode_combo.findData(mode)
+        if mode_index >= 0:
+            self.cut_mode_combo.setCurrentIndex(mode_index)
+        signature = cut_plan.get("time_signature", settings.get("time_signature", "4/4"))
+        signature_index = self.time_signature_combo.findData(signature)
+        if signature_index >= 0:
+            self.time_signature_combo.setCurrentIndex(signature_index)
+        swing = cut_plan.get("swing_percent", settings.get("swing_percent", 50.0))
+        if "swing_percent" in settings:
+            set_value(self.swing_spin, "swing_percent")
+        else:
+            self.swing_spin.setValue(float(swing or 50.0))
+        if mode == "pattern":
+            regions = cut_plan.get("pattern", cut_plan.get("intervals", []))
+        else:
+            regions = settings.get(
+                "user_boundaries",
+                cut_plan.get("regions", cut_plan.get("boundaries_sec", settings.get("loop_boundaries_sec", []))),
+            )
+        boundaries = _parse_user_boundaries(regions)
+        self.user_boundary_edit.setText(", ".join(f"{value:.9g}" for value in boundaries))
+        settings.update(
+            {
+                "loop_cut_mode": mode,
+                "time_signature": signature,
+                "swing_percent": float(swing or 50.0),
+                "user_boundaries": boundaries,
+            }
+        )
+
+    def _open_analysis_json(self) -> None:
+        current = self.json_edit.text() or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(self, "保存済み解析JSONを開く", current, "BMS解析 (*.bra.json *.json);;JSON (*.json)")
+        if not path:
+            return
+        try:
+            json_path = Path(path)
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+            result = analysis_result_from_dict(data)
+            self._restore_result_settings(result, data)
+            exported = result.settings.get("exports", {}) if isinstance(result.settings, dict) else {}
+            exported = dict(exported) if isinstance(exported, dict) else {}
+            self.json_edit.setText(str(json_path.resolve()))
+            if exported.get("samples_dir"):
+                self.samples_edit.setText(str(exported["samples_dir"]))
+            for key, widget in (("csv", self.csv_edit), ("bms", self.bms_edit), ("bmson", self.bmson_edit)):
+                if exported.get(key):
+                    widget.setText(str(exported[key]))
+            source = Path(result.source).expanduser()
+            if not source.is_absolute():
+                source = json_path.parent / source
+            if source.exists() and source.is_file():
+                source = source.resolve()
+                self.input_edit.setText(str(source))
+                self.drop_zone.title.setText(source.name)
+                self.drop_zone.hint.setText("保存済み解析 · レビューを再開")
+                self.waveform.set_source_path(source)
+            else:
+                self.input_edit.setText(str(result.source))
+                self.drop_zone.title.setText("保存済み解析結果")
+                self.drop_zone.hint.setText("元WAVがあれば再生できます")
+            self._on_result(result, exported)
+            self._set_running(False)
+            self._update_start_enabled()
+            self._log(f"解析結果を再開しました: {json_path}")
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            self._show_error("解析JSONを開けません", str(exc))
 
     def _browse_csv(self) -> None:
         current = self.csv_edit.text() or str(Path.home() / "events.csv")
@@ -1713,6 +2131,20 @@ class MainWindow(QMainWindow):
                 index = self.beat_division_combo.findData(int(values["beat_division"]))
                 if index >= 0:
                     self.beat_division_combo.setCurrentIndex(index)
+            cut_plan = values.get("cut_plan", {})
+            if isinstance(cut_plan, dict):
+                mode_index = self.cut_mode_combo.findData(_canonical_cut_mode(cut_plan.get("mode", "auto")))
+                if mode_index >= 0:
+                    self.cut_mode_combo.setCurrentIndex(mode_index)
+                signature_index = self.time_signature_combo.findData(cut_plan.get("time_signature", "4/4"))
+                if signature_index >= 0:
+                    self.time_signature_combo.setCurrentIndex(signature_index)
+                if "swing_percent" in cut_plan:
+                    self.swing_spin.setValue(float(cut_plan["swing_percent"]))
+                boundaries = cut_plan.get("boundaries_sec", cut_plan.get("points", cut_plan.get("pattern", [])))
+                if boundaries:
+                    self.user_boundary_edit.setText(", ".join(f"{value:.3f}" for value in _parse_user_boundaries(boundaries)))
+                self._on_cut_settings_changed()
             self._log(f"プリセットを読み込みました: {path}")
         except (OSError, ValueError, TypeError) as exc:
             self._show_error("プリセットを読み込めません", str(exc))
@@ -1746,6 +2178,31 @@ class MainWindow(QMainWindow):
         input_valid = bool(input_path and input_path.is_file())
         self.analyze_button.setEnabled(not running and input_valid and self._bpm_is_valid())
 
+    def _cut_plan_settings(self, boundaries: list[float] | None = None) -> dict:
+        """Build the small cut-plan contract understood by the core analyzer."""
+        mode = _canonical_cut_mode(self.cut_mode_combo.currentData())
+        boundaries = _parse_user_boundaries(
+            self.user_boundary_edit.text() if boundaries is None else boundaries
+        )
+        plan = {
+            "mode": mode,
+            "time_signature": self.time_signature_combo.currentData() or "4/4",
+            "subdivision": int(self.subdivision_spin.value()),
+            "swing_percent": float(self.swing_spin.value()),
+            "margin_percent": float(self.margin_spin.value()),
+            "regions": boundaries,
+        }
+        if mode == "grid":
+            plan.update({"rule": "beats", "beats": 1.0})
+        elif mode == "manual":
+            plan["boundaries_sec"] = boundaries
+            plan["points"] = boundaries
+        elif mode == "pattern":
+            beat_step = (60.0 / max(1e-9, self.bpm_spin.value())) / max(1, self.subdivision_spin.value())
+            plan["pattern"] = boundaries or [beat_step]
+            plan["intervals"] = plan["pattern"]
+        return plan
+
     def _settings(self) -> dict:
         if not self._bpm_is_valid():
             raise ValueError(self._bpm_error_text())
@@ -1773,7 +2230,41 @@ class MainWindow(QMainWindow):
             "subdivision": self.subdivision_spin.value(),
             "fast_compare": self.fast_compare_check.isChecked(),
             "bms_channel": self.bms_channel_combo.currentData() or "01",
+            "loop_cut_mode": _canonical_cut_mode(self.cut_mode_combo.currentData()),
+            "time_signature": self.time_signature_combo.currentData() or "4/4",
+            "swing_percent": self.swing_spin.value(),
+            "user_boundaries": _parse_user_boundaries(self.user_boundary_edit.text()),
+            "cut_plan": self._cut_plan_settings(),
+            "hit_type_overrides": {},
+            "cut_overrides": {},
         }
+
+    def _apply_user_boundaries(self) -> None:
+        boundaries = _parse_user_boundaries(self.user_boundary_edit.text())
+        self.user_boundary_edit.setText(", ".join(f"{value:.3f}" for value in boundaries))
+        self._on_cut_settings_changed()
+        self._log(f"ユーザー境界を{len(boundaries)}件反映しました")
+
+    def _on_cut_settings_changed(self, _value=None) -> None:
+        boundaries = _parse_user_boundaries(self.user_boundary_edit.text())
+        self.waveform.cut_mode = _canonical_cut_mode(self.cut_mode_combo.currentData())
+        self.waveform.time_signature = self.time_signature_combo.currentData() or "4/4"
+        self.waveform.swing_percent = self.swing_spin.value()
+        self.waveform.user_boundaries = boundaries
+        if self.result:
+            self.result.settings.update(
+                {
+                    "loop_cut_mode": self.waveform.cut_mode,
+                    "time_signature": self.waveform.time_signature,
+                    "swing_percent": self.waveform.swing_percent,
+                    "user_boundaries": boundaries,
+                    "cut_plan": self._cut_plan_settings(boundaries),
+                }
+            )
+        self.cut_status_label.setText(
+            f"{CUT_MODE_LABELS.get(self.waveform.cut_mode, self.waveform.cut_mode)} · 境界{len(boundaries)}件"
+        )
+        self.waveform.canvas.update()
 
     def _outputs(self) -> dict:
         input_path = Path(self.input_edit.text())
@@ -1905,6 +2396,8 @@ class MainWindow(QMainWindow):
             return
         self.result = None
         self.rows = []
+        self._active_hit_id = None
+        self._set_selection_actions(False)
         self.waveform.set_result(None)
         self.hit_table.setRowCount(0)
         self.sample_list.clear()
@@ -1946,6 +2439,32 @@ class MainWindow(QMainWindow):
     @Slot(object, object)
     def _on_result(self, result: AnalysisResult, exported: dict) -> None:
         self.result, self.exported = result, exported
+        result.settings.setdefault("active_hit_ids", [int(hit.id) for hit in result.hits])
+        cut_plan = result.settings.get("cut_plan", {}) if isinstance(result.settings, dict) else {}
+        cut_plan = cut_plan if isinstance(cut_plan, dict) else {}
+        cut_mode = _canonical_cut_mode(cut_plan.get("mode", result.settings.get("loop_cut_mode", "auto")))
+        cut_mode_index = self.cut_mode_combo.findData(cut_mode)
+        if cut_mode_index >= 0:
+            self.cut_mode_combo.setCurrentIndex(cut_mode_index)
+        signature_index = self.time_signature_combo.findData(
+            cut_plan.get("time_signature", result.settings.get("time_signature", "4/4"))
+        )
+        if signature_index >= 0:
+            self.time_signature_combo.setCurrentIndex(signature_index)
+        self.swing_spin.setValue(float(cut_plan.get("swing_percent", result.settings.get("swing_percent", 50.0)) or 50.0))
+        boundary_source = (
+            cut_plan.get("pattern", cut_plan.get("intervals", []))
+            if cut_mode == "pattern"
+            else result.settings.get(
+                "user_boundaries",
+                cut_plan.get("regions", cut_plan.get("boundaries_sec", result.settings.get("loop_boundaries_sec", []))),
+            )
+        )
+        boundaries = _parse_user_boundaries(
+            boundary_source
+        )
+        self.user_boundary_edit.setText(", ".join(f"{value:.3f}" for value in boundaries))
+        self._on_cut_settings_changed()
         self._cluster_base_thresholds = (
             float(result.settings.get("threshold", 0.95)),
             float(result.settings.get("spectral_threshold", 0.94)),
@@ -1956,6 +2475,8 @@ class MainWindow(QMainWindow):
         self._update_cluster_threshold_label(self.cluster_slider.value())
         self._update_cluster_controls(False)
         self.rows = classify_hits(result)
+        self._active_hit_id = self.rows[0]["id"] if self.rows else None
+        self._set_selection_actions(bool(self.rows))
         self.waveform.set_result(result)
         summary = result.summary
         self.required_card.value.setText(str(summary["required_samples"]))
@@ -2011,6 +2532,31 @@ class MainWindow(QMainWindow):
         self._processing_stage = "解析完了"
         self.status_label.setText("解析結果を表示中")
 
+    def _refresh_result_view(self) -> None:
+        """Refresh all GUI projections after the core rebuilds a review plan."""
+        if not self.result:
+            return
+        exports = self.result.settings.get("exports", {})
+        if isinstance(exports, dict):
+            self.exported = dict(exports)
+        self.rows = classify_hits(self.result)
+        self.waveform.set_result(self.result)
+        summary = self.result.summary
+        self.required_card.value.setText(str(summary["required_samples"]))
+        self.hits_card.value.setText(str(summary["detected_hits"]))
+        self.reuse_card.value.setText(f"{summary['reuse_ratio']:.1f}%")
+        self.review_card.value.setText(str(sum(row["classification"] in {"UNSURE", "OVERLAP"} for row in self.rows)))
+        self._refresh_table()
+        self.sample_list.clear()
+        sample_paths = self.exported.get("samples", []) if isinstance(self.exported, dict) else []
+        if isinstance(sample_paths, list) and sample_paths:
+            for path in sample_paths:
+                self.sample_list.addItem(QListWidgetItem(Path(path).name))
+        else:
+            for cluster in self.result.plan.clusters:
+                self.sample_list.addItem(QListWidgetItem(f"sample_{cluster.id:03d}"))
+        self._update_cluster_controls(False)
+
     @Slot(str)
     def _on_failed(self, details: str) -> None:
         if "Could not read WAV" in details:
@@ -2035,8 +2581,9 @@ class MainWindow(QMainWindow):
     def _refresh_table(self) -> None:
         if not hasattr(self, "hit_table"):
             return
-        selected = self._selected_row_id()
+        selected = self._active_hit_id if self._active_hit_id is not None else self._selected_row_id()
         wanted = self.filter_combo.currentData() if hasattr(self, "filter_combo") else "All"
+        sound_wanted = self.sound_filter_combo.currentData() if hasattr(self, "sound_filter_combo") else "All"
         query = self.search_edit.text().strip().casefold() if hasattr(self, "search_edit") else ""
         self.hit_table.setSortingEnabled(False)
         self.hit_table.setRowCount(0)
@@ -2045,7 +2592,9 @@ class MainWindow(QMainWindow):
                 continue
             if wanted not in {"All", "REVIEW"} and row["classification"] != wanted:
                 continue
-            haystack = f"{row['id']} {row['time']:.3f} {row['sample_id']}".casefold()
+            if sound_wanted not in {"All", row.get("sound_type", "other")}:
+                continue
+            haystack = f"{row['id']} {row['time']:.3f} {row['sample_id']} {row.get('sound_type', '')} {row.get('event_flags', '')}".casefold()
             if query and query not in haystack:
                 continue
             index = self.hit_table.rowCount()
@@ -2058,6 +2607,8 @@ class MainWindow(QMainWindow):
                 f"{row['gain_db']:+.2f} dB",
                 row["sample_id"],
                 "音の重なり" if row["overlap"] else "",
+                INSTRUMENT_LABELS.get(row.get("sound_type", "other"), "その他"),
+                row.get("cut_state") or row.get("event_flags", ""),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -2086,42 +2637,60 @@ class MainWindow(QMainWindow):
                 self._table_selection_changed(index, 0, -1, -1)
                 return
 
+    def _rebuild_review_plan(self) -> bool:
+        if not self.result:
+            return False
+        exports = self.result.settings.get("exports", {})
+        exports = dict(exports) if isinstance(exports, dict) else {}
+        if isinstance(self.exported, dict):
+            exports.update({key: value for key, value in self.exported.items() if key != "validation"})
+        if self.json_edit.text().strip():
+            exports.setdefault("json", self.json_edit.text().strip())
+        self.result.settings["exports"] = exports
+        try:
+            recluster_result(self.result, reexport=True)
+        except (OSError, ValueError, RuntimeError, TypeError) as exc:
+            self._show_error("レビュー結果を同期できません", str(exc))
+            return False
+        self._refresh_result_view()
+        self._save_review_state()
+        validation = self.result.settings.get("validation", {})
+        self._log(f"レビュー結果を再構築しました · 出力チェック: {'OK' if validation.get('ok', True) else '要確認'}")
+        return True
+
     def _apply_review(self, key: str) -> None:
-        hit_id = self._selected_row_id()
+        hit_id = self._active_selection_id()
         if hit_id is None or not self.result:
             return
+        active_ids = {
+            int(value)
+            for value in self.result.settings.get("active_hit_ids", [hit.id for hit in self.result.hits])
+        }
         overrides = self.result.settings.setdefault("review_overrides", {})
-        overrides[str(hit_id)] = key
-        row = next((item for item in self.rows if item["id"] == hit_id), None)
-        if key == "D":
-            old_cluster = next((cluster for cluster in self.result.plan.clusters if hit_id in cluster.hit_ids), None)
-            if old_cluster and len(old_cluster.hit_ids) > 1:
-                old_cluster.hit_ids.remove(hit_id)
-                new_id = max((cluster.id for cluster in self.result.plan.clusters), default=0) + 1
-                self.result.plan.clusters.append(Cluster(new_id, hit_id, [hit_id]))
-                for event in self.result.plan.events:
-                    if int(event.get("hit", -1)) == hit_id:
-                        event["sample_id"] = f"sample_{new_id:03d}"
-                self.result.settings.setdefault("review_targets", {})[str(hit_id)] = new_id
-        if row:
-            row["review_override"] = key
-            row["classification"] = "IGNORED" if key == "I" else {"S": "SAME", "G": "GAIN_VARIANT", "D": "DIFFERENT"}[key]
-        # Keep an explicit target for downstream exporters and future cluster UI.
-        if key in {"S", "G"} and row and row.get("cluster_id"):
-            self.result.settings.setdefault("review_targets", {})[str(hit_id)] = row["cluster_id"]
-        if key == "I":
-            exclude_hit(self.result, hit_id)
+        restoring = key == "I" and (int(hit_id) not in active_ids or str(overrides.get(str(hit_id), "")).upper() == "I")
+        if key == "I" and not restoring:
+            active_ids.discard(int(hit_id))
         else:
-            refresh_reproducibility(self.result)
-        self.rows = classify_hits(self.result)
-        summary = self.result.summary
-        self.required_card.value.setText(str(summary["required_samples"]))
-        self.hits_card.value.setText(str(summary["detected_hits"]))
-        self.reuse_card.value.setText(f"{summary['reuse_ratio']:.1f}%")
-        self.review_card.value.setText(str(sum(item["classification"] in {"UNSURE", "OVERLAP"} for item in self.rows)))
-        self._refresh_table()
-        self._save_review_state()
-        self._log(f"ヒット{hit_id:03d}を{key}で確定しました")
+            active_ids.add(int(hit_id))
+        self.result.settings["active_hit_ids"] = sorted(active_ids)
+        self.result.settings["excluded_hits"] = sorted({int(hit.id) for hit in self.result.hits} - active_ids)
+        if restoring:
+            overrides.pop(str(hit_id), None)
+        else:
+            overrides[str(hit_id)] = key
+        row = next((item for item in self.rows if item["id"] == hit_id), None)
+        targets = self.result.settings.setdefault("review_targets", {})
+        if key in {"S", "G"}:
+            target = self.review_target_combo.currentData()
+            if target is None and row:
+                target = row.get("cluster_id")
+            if target is not None:
+                targets[str(hit_id)] = int(target)
+        elif not restoring:
+            targets.pop(str(hit_id), None)
+        if not self._rebuild_review_plan():
+            return
+        self._log(f"ヒット{hit_id:03d}を{'復元' if restoring else f'{key}で確定'}しました")
 
     def _save_review_state(self) -> None:
         if not self.result:
@@ -2159,17 +2728,29 @@ class MainWindow(QMainWindow):
                     offset=float(self.result.settings.get("offset", 0.0)),
                     subdivision=int(self.result.settings.get("subdivision", 16)),
                     channel=str(self.result.settings.get("bms_channel", "01")),
-                    wav_prefix=relative_sample_prefix(outputs["bms"], Path(outputs["samples"][0]).parent if isinstance(outputs.get("samples"), list) and outputs["samples"] else None),
+                    wav_prefix=relative_sample_prefix_for_export(outputs["bms"], Path(outputs["samples"][0]).parent if isinstance(outputs.get("samples"), list) and outputs["samples"] else None),
                     excluded_hits=excluded,
                 )
             if outputs.get("bmson"):
-                write_bmson(outputs["bmson"], self.result.plan, bpm=self.result.settings.get("bpm"), offset=float(self.result.settings.get("offset", 0.0)), excluded_hits=excluded)
+                sample_dir = (
+                    Path(outputs["samples"][0]).parent
+                    if isinstance(outputs.get("samples"), list) and outputs["samples"]
+                    else outputs.get("samples_dir")
+                )
+                write_bmson(
+                    outputs["bmson"],
+                    self.result.plan,
+                    bpm=self.result.settings.get("bpm"),
+                    offset=float(self.result.settings.get("offset", 0.0)),
+                    wav_prefix=relative_sample_prefix_for_export(outputs["bmson"], sample_dir),
+                    excluded_hits=excluded,
+                )
             outputs["validation"] = validate_exports(self.result, outputs)
             self.result.settings["validation"] = outputs["validation"]
             self.result.settings["exports"] = {key: value for key, value in outputs.items() if key != "validation"}
             if json_path:
                 write_json(json_path, self.result.to_dict())
-        except OSError as exc:
+        except (OSError, ValueError, RuntimeError, TypeError) as exc:
             self._log(f"レビュー保存エラー: {exc}")
 
     def _selected_row_id(self) -> int | None:
@@ -2190,15 +2771,37 @@ class MainWindow(QMainWindow):
         row = next((row for row in self.rows if row["id"] == hit_id), None)
         if not row:
             return
+        self._active_hit_id = hit_id
         self.waveform.set_selected(hit_id)
+        type_index = self.hit_type_combo.findData(row.get("sound_type", "other"))
+        if type_index >= 0:
+            self.hit_type_combo.blockSignals(True)
+            self.hit_type_combo.setCurrentIndex(type_index)
+            self.hit_type_combo.blockSignals(False)
+        self.review_target_combo.blockSignals(True)
+        self.review_target_combo.clear()
+        self.review_target_combo.addItem("推奨（現在のクラスタ）", None)
+        cluster_ids = sorted({int(cluster.id) for cluster in self.result.plan.clusters}) if self.result else []
+        for cluster_id in cluster_ids:
+            self.review_target_combo.addItem(f"クラスタ {cluster_id:03d}", cluster_id)
+        target = self.result.settings.get("review_targets", {}).get(str(hit_id)) if self.result else None
+        try:
+            target_index = self.review_target_combo.findData(int(target)) if target is not None else 0
+        except (TypeError, ValueError):
+            target_index = 0
+        self.review_target_combo.setCurrentIndex(max(0, target_index))
+        self.review_target_combo.blockSignals(False)
+        self._set_selection_actions(True)
         label = CLASS_LABELS.get(row["classification"], row["classification"])
         self.detail_title.setText(f"ヒット {row['id']:03d}  ·  {label}")
         self.detail_title.setStyleSheet(f"color:{CLASS_COLORS.get(row['classification'], '#e5e7eb')};font-size:12pt;font-weight:700;")
         profile = self.result.settings.get("similarity_profile", {}) if self.result else {}
         profile_name = "波形・スペクトル優先" if profile.get("name") == "waveform_spectral_v2" else profile.get("name", "類似度優先")
         warning = "  ·  警告: 音の重なり" if row["overlap"] else ""
+        event_flags = f"  ·  {row['event_flags']}" if row.get("event_flags") else ""
+        cut_state = f"  ·  切断{row['cut_state']}" if row.get("cut_state") else ""
         self.detail_metrics.setText(
-            f"時刻 {format_seconds(row['time'])}  ·  {row['sample_id']}  ·  信頼度 {row['confidence']:.1f}%  ·  音量差 {row['gain_db']:+.2f} dB{warning}\n"
+            f"時刻 {format_seconds(row['time'])}  ·  {row['sample_id']}  ·  音種 {INSTRUMENT_LABELS.get(row.get('sound_type', 'other'), 'その他')}  ·  信頼度 {row['confidence']:.1f}%  ·  音量差 {row['gain_db']:+.2f} dB{warning}{event_flags}{cut_state}\n"
             f"正規化波形 {row['waveform'] * 100:.2f}%   生波形 {row['raw'] * 100:.2f}%   スペクトル {row['spectral'] * 100:.2f}%   "
             f"アタック {row['attack'] * 100:.2f}%   ボディ {row['body'] * 100:.2f}%   テール {row['tail'] * 100:.2f}%\n"
             f"判定プロファイル {profile_name}  ·  "
@@ -2206,6 +2809,67 @@ class MainWindow(QMainWindow):
             f"スペクトル基準 {float(profile.get('spectral_threshold', 0.94)):.3f}  ·  "
             f"位置合わせ ±{float(profile.get('alignment_ms', 20.0)):.1f}ms"
         )
+
+    def _active_selection_id(self) -> int | None:
+        selected = self._selected_row_id()
+        return self._active_hit_id if self._active_hit_id is not None else selected
+
+    def _set_selection_actions(self, enabled: bool) -> None:
+        for button in (
+            self.hit_type_combo,
+            self.hit_type_apply_button,
+            self.review_target_combo,
+            self.preview_cut_button,
+            self.accept_cut_button,
+            self.exclude_cut_button,
+        ):
+            button.setEnabled(bool(enabled))
+
+    def _apply_hit_type(self) -> None:
+        hit_id = self._active_selection_id()
+        if hit_id is None or not self.result:
+            return
+        value = self.hit_type_combo.currentData() or "other"
+        overrides = self.result.settings.setdefault("hit_type_overrides", {})
+        overrides[str(hit_id)] = value
+        hit = next((item for item in self.result.hits if int(item.id) == int(hit_id)), None)
+        if hit is not None:
+            hit.instrument = value
+        if not self._rebuild_review_plan():
+            return
+        self._log(f"ヒット{int(hit_id):03d}の音種を{INSTRUMENT_LABELS.get(value, 'その他')}に変更しました")
+
+    def _preview_selected_cut(self) -> None:
+        hit_id = self._active_selection_id()
+        row = next((item for item in self.rows if item["id"] == hit_id), None)
+        if not row:
+            return
+        self.waveform.set_selected(hit_id)
+        self.waveform.play_range(float(row["start"]), float(row["end"]))
+        self._log(f"ヒット{int(hit_id):03d}の切断位置をプレビューしています")
+
+    def _set_cut_override(self, state: str) -> None:
+        hit_id = self._active_selection_id()
+        if hit_id is None or not self.result:
+            return
+        settings = self.result.settings
+        overrides = settings.setdefault("cut_overrides", {})
+        overrides[str(hit_id)] = state
+        all_ids = {int(hit.id) for hit in self.result.hits}
+        active = {int(value) for value in settings.get("active_hit_ids", all_ids) if int(value) in all_ids}
+        if state == "excluded":
+            active.discard(int(hit_id))
+        else:
+            active.add(int(hit_id))
+        settings["active_hit_ids"] = sorted(active)
+        settings["excluded_hits"] = sorted(all_ids - active)
+        if not self._rebuild_review_plan():
+            return
+        self.cut_status_label.setText(
+            f"{CUT_MODE_LABELS.get(self.waveform.cut_mode, self.waveform.cut_mode)} · "
+            f"境界{len(self.waveform.user_boundaries)}件 · 採用{len(active)}/{len(all_ids)}件"
+        )
+        self._log(f"ヒット{int(hit_id):03d}の切断を{'除外' if state == 'excluded' else '採用'}しました")
 
     def _sample_path_for_selected(self) -> Path | None:
         hit_id = self._selected_row_id()

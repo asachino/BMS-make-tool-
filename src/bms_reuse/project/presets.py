@@ -12,6 +12,10 @@ PRESET_KEYS = {
     "min_separation_ms", "pre_roll_ms", "window_ms", "max_alignment_ms",
     "bpm", "offset", "subdivision", "beat_division", "margin_percent",
     "margin", "fade_in_ms", "fade_out_ms", "fast_compare", "bms_channel",
+    "loop_rule", "loop_seconds", "loop_beats", "loop_bars", "loop_start_sec",
+    "loop_points", "loop_pattern", "cut_plan", "automation_detection",
+    "automation_volume_threshold_db", "automation_timbre_threshold",
+    "automation_pan_threshold_db", "automation_chop_floor",
 }
 
 

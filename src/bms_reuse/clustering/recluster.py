@@ -16,6 +16,7 @@ from ..classification.classifier import (
     DEFAULT_WAVEFORM_THRESHOLD,
     classify_report,
 )
+from ..features.percussion import instruments_compatible
 from ..similarity.score import SimilarityReport
 from .reuse_plan import Cluster, ReusePlan
 
@@ -124,6 +125,8 @@ def _reverse_report(report: SimilarityReport) -> SimilarityReport:
 
 def _accepted(report: SimilarityReport, thresholds: dict[str, float]) -> bool:
     return (
+        bool(getattr(report, "instrument_compatible", True))
+        and
         float(report.gain_normalized_similarity) >= thresholds["waveform"]
         and float(report.spectral_similarity) >= thresholds["spectral"]
     )
@@ -131,6 +134,13 @@ def _accepted(report: SimilarityReport, thresholds: dict[str, float]) -> bool:
 
 def _feature_report(reference, candidate) -> SimilarityReport | None:
     """Make a conservative report from serialized shape features only."""
+    if reference is None or candidate is None:
+        return None
+    if not instruments_compatible(
+        getattr(reference, "instrument", "kick"),
+        getattr(candidate, "instrument", "kick"),
+    ):
+        return None
     left = getattr(reference, "features", {}) or {}
     right = getattr(candidate, "features", {}) or {}
     keys = ("centroid_hz", "rolloff_hz", "zcr", "attack_ms", "tail_energy")
@@ -141,12 +151,17 @@ def _feature_report(reference, candidate) -> SimilarityReport | None:
             abs(float(left[key]) - float(right[key])) / max(1e-6, abs(float(left[key])), abs(float(right[key])))
             for key in keys
         ]
+        optional_keys = ("band_low_ratio", "band_mid_ratio", "band_high_ratio", "transient_ratio", "decay_ratio", "percussion_zcr")
+        for key in optional_keys:
+            if key in left and key in right:
+                differences.append(abs(float(left[key]) - float(right[key])))
     except (TypeError, ValueError, OverflowError):
         return None
     similarity = max(0.0, min(1.0, 1.0 - sum(differences) / len(differences)))
     return SimilarityReport(
         int(reference.id), int(candidate.id), similarity, similarity, 0.0,
         similarity, similarity, similarity, similarity, 0,
+        instrument_compatible=True,
     )
 
 
@@ -240,6 +255,15 @@ def recluster_plan(
         for cluster in clusters:
             if cluster.representative_hit in forced_different:
                 continue
+            # Saved reports from an older schema may not carry the instrument
+            # gate.  Re-check the actual hit metadata here so a stale TRUE
+            # flag can never mix kick/snare/hat clusters.  S/G is applied in
+            # the explicit review-move pass below and remains an override.
+            if not instruments_compatible(
+                getattr(hit_by_id.get(cluster.representative_hit), "instrument", "kick"),
+                getattr(hit, "instrument", "kick"),
+            ):
+                continue
             report = find_report(cluster, hit_id)
             if report is None or not _accepted(report, thresholds):
                 continue
@@ -270,6 +294,8 @@ def recluster_plan(
             current.hit_ids.remove(hit_id)
             if not current.hit_ids:
                 clusters.remove(current)
+            elif current.representative_hit == hit_id:
+                current.representative_hit = current.hit_ids[0]
         target_cluster.hit_ids.append(hit_id)
         assignments[hit_id] = target_cluster.id
         gains[hit_id] = gain
@@ -320,6 +346,15 @@ def recluster_plan(
     for report in reports:
         if report.reference_id in excluded or report.candidate_id in excluded:
             continue
+        reference = hit_by_id.get(int(report.reference_id))
+        candidate = hit_by_id.get(int(report.candidate_id))
+        if not instruments_compatible(
+            getattr(reference, "instrument", "kick"),
+            getattr(candidate, "instrument", "kick"),
+        ):
+            # Keep serialized reports truthful even when they came from a
+            # pre-instrument schema whose compatibility flag defaulted true.
+            report.instrument_compatible = False
         updated = classify_report(
             report,
             threshold=thresholds["waveform"],

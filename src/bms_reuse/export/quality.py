@@ -32,11 +32,28 @@ def _referenced_files(path: Path) -> list[Path]:
     return []
 
 
+def _bms_event_count(path: Path) -> int:
+    """Count non-empty event cells in a generated BMS channel map."""
+    count = 0
+    pattern = re.compile(r"^#\d{3}\d{2}:([0-9A-Z]+)$", re.IGNORECASE)
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = pattern.match(line.strip())
+        if not match or len(match.group(1)) % 2:
+            continue
+        count += sum(
+            match.group(1)[offset:offset + 2].upper() != "00"
+            for offset in range(0, len(match.group(1)), 2)
+        )
+    return count
+
+
 def check_export_quality(result, exported: dict | None = None) -> dict:
     exported = exported or {}
     sample_paths = exported.get("samples", []) if isinstance(exported, dict) else []
     sample_paths = list(sample_paths) if isinstance(sample_paths, (list, tuple)) else []
     expected = int(result.plan.required_samples)
+    active_ids = result.settings.get("active_hit_ids") if isinstance(getattr(result, "settings", None), dict) else None
+    active_hit_count = len(active_ids) if isinstance(active_ids, list) else len(result.hits)
     sample_dir = Path(exported["samples_dir"]) if exported.get("samples_dir") else None
     # An empty optional ``samples`` list is how CLI/GUI represent "not
     # requested".  A directory or at least one referenced file means the
@@ -49,7 +66,7 @@ def check_export_quality(result, exported: dict | None = None) -> dict:
         "sample_count_matches_clusters": len(sample_paths) == expected if sample_requested else True,
         "sample_files_exist": all(path.is_file() for path in sample_files) if sample_requested else True,
         "sample_folder_has_no_extra_wav": actual_files == sample_files if sample_dir else True,
-        "event_count_matches_hits": len(result.plan.events) == len(result.hits),
+        "event_count_matches_hits": len(result.plan.events) == active_hit_count,
         "cluster_ids_unique": len({cluster.id for cluster in result.plan.clusters}) == expected,
         "source_hash_present": bool(result.source_hash),
     }
@@ -61,13 +78,24 @@ def check_export_quality(result, exported: dict | None = None) -> dict:
                 try:
                     references = _referenced_files(export_path)
                     checks[f"{key}_references_exist"] = all(reference.is_file() for reference in references)
+                    if key == "bms":
+                        checks["bms_event_count_matches_hits"] = _bms_event_count(export_path) == active_hit_count
+                        # Older versions emitted this marker after dropping a
+                        # colliding event.  It is intentionally invalid now:
+                        # collision handling must remain non-lossy.
+                        text = export_path.read_text(encoding="utf-8")
+                        checks["bms_grid_collisions_preserved"] = "後続を省略" not in text
                 except (OSError, ValueError, json.JSONDecodeError):
                     checks[f"{key}_references_exist"] = False
+                    if key == "bms":
+                        checks["bms_event_count_matches_hits"] = False
+                        checks["bms_grid_collisions_preserved"] = False
     return {
         "ok": all(checks.values()),
         "checks": checks,
         "expected_samples": expected,
         "actual_samples": len(sample_paths),
+        "active_hits": active_hit_count,
         "missing_samples": sorted(str(path) for path in sample_files if not path.is_file()),
         "extra_samples": sorted(str(path) for path in actual_files - sample_files),
     }

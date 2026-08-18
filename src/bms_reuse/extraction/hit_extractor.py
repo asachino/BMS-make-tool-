@@ -20,11 +20,20 @@ class Hit:
     source_end: int
     overlap_warning: bool = False
     features: dict = field(default_factory=dict)
+    instrument: str = "kick"
+    automation: dict = field(default_factory=dict)
+    segment_index: int | None = None
+    segment_rule: str = "off"
 
     @property
     def sample_count(self) -> int:
         shape = getattr(self.samples, "shape", None)
         return int(shape[0]) if shape is not None else len(self.samples)
+
+    @property
+    def variations(self) -> list[str]:
+        values = self.automation.get("variations", []) if isinstance(self.automation, dict) else []
+        return [str(value) for value in values] if isinstance(values, (list, tuple)) else []
 
     def to_dict(self, include_samples: bool = False) -> dict:
         data = {
@@ -35,6 +44,11 @@ class Hit:
             "source_end": self.source_end,
             "overlap_warning": self.overlap_warning,
             "features": self.features,
+            "instrument": self.instrument,
+            "automation": self.automation,
+            "variations": self.variations,
+            "segment_index": self.segment_index,
+            "segment_rule": self.segment_rule,
         }
         if include_samples:
             data["samples"] = as_float_list(self.samples)

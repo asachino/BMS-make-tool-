@@ -8,12 +8,18 @@ import sys
 import time
 from pathlib import Path
 
-from .application import analysis_result_from_dict, analyze_file, recluster_result, record_output_timing
+from .application import (
+    analysis_result_from_dict,
+    analyze_file,
+    recluster_result,
+    record_output_timing,
+    relative_sample_prefix_for_export,
+)
 from .batch import run_batch
 from .export.csv_exporter import write_hits_csv
 from .export.json_exporter import write_json
 from .export.wav_exporter import write_hit_wavs
-from .export.bms_exporter import relative_sample_prefix, write_bms
+from .export.bms_exporter import write_bms
 from .export.bmson_exporter import write_bmson
 from .export.quality import validate_exports
 from .project.presets import load_preset, save_preset
@@ -22,6 +28,15 @@ from .audio.loader import load_audio
 
 def _same_path(left: Path, right: Path) -> bool:
     return str(left.resolve()).casefold() == str(right.resolve()).casefold()
+
+
+def _number_list(value):
+    if not value:
+        return None
+    try:
+        return [float(item.strip()) for item in str(value).split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError("loop points/pattern must be comma-separated numbers") from exc
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -50,6 +65,19 @@ def _parser() -> argparse.ArgumentParser:
     analyze.add_argument("--bms-channel", default="01", help="BMS event channel (default: BGM 01; 11+ for key-sounds)")
     analyze.add_argument("--fade-in-ms", type=float, default=0.0)
     analyze.add_argument("--fade-out-ms", type=float, default=0.0)
+    analyze.add_argument("--loop-rule", choices=("off", "seconds", "beats", "bars", "points", "grid"), default="off")
+    analyze.add_argument("--loop-seconds", type=float)
+    analyze.add_argument("--loop-beats", type=float)
+    analyze.add_argument("--loop-bars", type=float)
+    analyze.add_argument("--loop-start-sec", type=float, default=0.0)
+    analyze.add_argument("--loop-points", help="manual cut points in seconds, comma separated")
+    analyze.add_argument("--loop-pattern", help="repeating cut intervals in seconds, comma separated")
+    analyze.add_argument("--cut-plan", choices=("auto", "grid", "manual", "pattern"), default=None)
+    analyze.add_argument("--no-automation-detection", action="store_true")
+    analyze.add_argument("--automation-volume-threshold-db", type=float, default=3.0)
+    analyze.add_argument("--automation-timbre-threshold", type=float, default=0.18)
+    analyze.add_argument("--automation-pan-threshold-db", type=float, default=3.0)
+    analyze.add_argument("--automation-chop-floor", type=float, default=0.08)
     analyze.add_argument("--preset-in", type=Path, help="load analysis settings from JSON preset")
     analyze.add_argument("--preset-out", type=Path, help="save effective analysis settings as JSON preset")
     analyze.add_argument("--full-json", action="store_true", help="print the complete JSON result")
@@ -66,6 +94,19 @@ def _parser() -> argparse.ArgumentParser:
     batch.add_argument("--bms-channel", default="01", help="BMS event channel (default: BGM 01; 11+ for key-sounds)")
     batch.add_argument("--fade-in-ms", type=float, default=0.0)
     batch.add_argument("--fade-out-ms", type=float, default=0.0)
+    batch.add_argument("--loop-rule", choices=("off", "seconds", "beats", "bars", "points", "grid"), default="off")
+    batch.add_argument("--loop-seconds", type=float)
+    batch.add_argument("--loop-beats", type=float)
+    batch.add_argument("--loop-bars", type=float)
+    batch.add_argument("--loop-start-sec", type=float, default=0.0)
+    batch.add_argument("--loop-points")
+    batch.add_argument("--loop-pattern")
+    batch.add_argument("--cut-plan", choices=("auto", "grid", "manual", "pattern"), default=None)
+    batch.add_argument("--no-automation-detection", action="store_true")
+    batch.add_argument("--automation-volume-threshold-db", type=float, default=3.0)
+    batch.add_argument("--automation-timbre-threshold", type=float, default=0.18)
+    batch.add_argument("--automation-pan-threshold-db", type=float, default=3.0)
+    batch.add_argument("--automation-chop-floor", type=float, default=0.08)
     batch.add_argument("--bms", action="store_true", help="write BMS per input (requires --bpm)")
     batch.add_argument("--bmson", action="store_true", help="write BMSON per input (requires --bpm)")
     recluster = commands.add_parser("recluster", help="reuse saved comparisons to change clustering without re-analysis")
@@ -95,6 +136,19 @@ def main(argv: list[str] | None = None) -> int:
                 bms_channel=args.bms_channel,
                 fade_in_ms=args.fade_in_ms,
                 fade_out_ms=args.fade_out_ms,
+                loop_rule=args.loop_rule,
+                loop_seconds=args.loop_seconds,
+                loop_beats=args.loop_beats,
+                loop_bars=args.loop_bars,
+                loop_start_sec=args.loop_start_sec,
+                loop_points=_number_list(args.loop_points),
+                loop_pattern=_number_list(args.loop_pattern),
+                cut_plan=args.cut_plan,
+                automation_detection=not args.no_automation_detection,
+                automation_volume_threshold_db=args.automation_volume_threshold_db,
+                automation_timbre_threshold=args.automation_timbre_threshold,
+                automation_pan_threshold_db=args.automation_pan_threshold_db,
+                automation_chop_floor=args.automation_chop_floor,
                 export_bms=args.bms,
                 export_bmson=args.bmson,
             )
@@ -154,6 +208,19 @@ def main(argv: list[str] | None = None) -> int:
             "fade_out_ms": args.fade_out_ms,
             "fast_compare": args.fast_compare,
             "bms_channel": args.bms_channel,
+            "loop_rule": args.loop_rule,
+            "loop_seconds": args.loop_seconds,
+            "loop_beats": args.loop_beats,
+            "loop_bars": args.loop_bars,
+            "loop_start_sec": args.loop_start_sec,
+            "loop_points": _number_list(args.loop_points),
+            "loop_pattern": _number_list(args.loop_pattern),
+            "cut_plan": args.cut_plan,
+            "automation_detection": not args.no_automation_detection,
+            "automation_volume_threshold_db": args.automation_volume_threshold_db,
+            "automation_timbre_threshold": args.automation_timbre_threshold,
+            "automation_pan_threshold_db": args.automation_pan_threshold_db,
+            "automation_chop_floor": args.automation_chop_floor,
         }
         if args.preset_in:
             preset = load_preset(args.preset_in)
@@ -163,6 +230,11 @@ def main(argv: list[str] | None = None) -> int:
                 "window_ms": 800.0, "max_alignment_ms": 20.0, "bpm": None,
                 "offset": 0.0, "subdivision": 16, "beat_division": None, "fade_in_ms": 0.0,
                 "fade_out_ms": 0.0, "fast_compare": False, "bms_channel": "01",
+                "loop_rule": "off", "loop_seconds": None, "loop_beats": None, "loop_bars": None,
+                "loop_start_sec": 0.0, "loop_points": None, "loop_pattern": None, "cut_plan": None,
+                "automation_detection": True, "automation_volume_threshold_db": 3.0,
+                "automation_timbre_threshold": 0.18, "automation_pan_threshold_db": 3.0,
+                "automation_chop_floor": 0.08,
             }
             cli_values = dict(settings)
             settings = dict(preset)
@@ -202,10 +274,16 @@ def main(argv: list[str] | None = None) -> int:
                 offset=settings.get("offset", 0.0),
                 subdivision=settings.get("subdivision", 16),
                 channel=str(settings.get("bms_channel", args.bms_channel)),
-                wav_prefix=relative_sample_prefix(args.bms, args.export_dir),
+                wav_prefix=relative_sample_prefix_for_export(args.bms, args.export_dir),
             )
         if args.bmson:
-            write_bmson(args.bmson, result.plan, bpm=settings.get("bpm"), offset=settings.get("offset", 0.0))
+            write_bmson(
+                args.bmson,
+                result.plan,
+                bpm=settings.get("bpm"),
+                offset=settings.get("offset", 0.0),
+                wav_prefix=relative_sample_prefix_for_export(args.bmson, args.export_dir),
+            )
         exported = {
             "json": str(output),
             "samples": [str(path) for path in exported_samples],

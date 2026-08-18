@@ -24,7 +24,11 @@ def classify_report(
     """
     waveform = float(report.gain_normalized_similarity)
     spectral = float(report.spectral_similarity)
-    similar = waveform >= threshold and spectral >= spectral_threshold
+    similar = bool(getattr(report, "instrument_compatible", True)) and waveform >= threshold and spectral >= spectral_threshold
+    if not getattr(report, "instrument_compatible", True):
+        report.classification = "DIFFERENT"
+        report.confidence = 0.0
+        return report
     if similar and abs(report.gain_db) < gain_tolerance_db:
         report.classification = "SAME"
         report.confidence = round(min(waveform, spectral) * 100.0, 2)

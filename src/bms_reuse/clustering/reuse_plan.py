@@ -10,10 +10,15 @@ from ..classification.classifier import (
     DEFAULT_WAVEFORM_THRESHOLD,
     classify_report,
 )
+from ..features.percussion import instruments_compatible
 from ..similarity.score import SimilarityReport
 
 
 _FEATURE_KEYS = ("centroid_hz", "rolloff_hz", "zcr", "attack_ms")
+_OPTIONAL_FEATURE_KEYS = (
+    "band_low_ratio", "band_mid_ratio", "band_high_ratio",
+    "transient_ratio", "decay_ratio", "percussion_zcr",
+)
 
 
 def _gain_invariant_features(features: dict) -> tuple[float, ...] | None:
@@ -25,6 +30,7 @@ def _gain_invariant_features(features: dict) -> tuple[float, ...] | None:
         rms_amplitude = max(1e-6, 10.0 ** (rms_db / 20.0))
         tail_ratio = float(features.get("tail_energy", 0.0)) / rms_amplitude
         values = tuple(float(features[key]) for key in _FEATURE_KEYS) + (tail_ratio,)
+        values += tuple(float(features.get(key, 0.0)) for key in _OPTIONAL_FEATURE_KEYS)
     except (TypeError, ValueError, OverflowError):
         return None
     return values if all(value == value and abs(value) != float("inf") for value in values) else None
@@ -32,6 +38,8 @@ def _gain_invariant_features(features: dict) -> tuple[float, ...] | None:
 
 def _feature_distance(left, right) -> float:
     """Rank representatives by a scale-normalized, gain-invariant distance."""
+    if not instruments_compatible(getattr(left, "instrument", "kick"), getattr(right, "instrument", "kick")):
+        return float("inf")
     left_values = _gain_invariant_features(getattr(left, "features", {}))
     right_values = _gain_invariant_features(getattr(right, "features", {}))
     if left_values is None or right_values is None:

@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 from typing import Callable
 
-from .application import analyze_file
-from .export.bms_exporter import relative_sample_prefix, write_bms
+from .application import analyze_file, relative_sample_prefix_for_export
+from .export.bms_exporter import write_bms
 from .export.bmson_exporter import write_bmson
 from .export.csv_exporter import write_hits_csv
 from .export.json_exporter import write_json
@@ -80,14 +80,24 @@ def run_batch(
                     offset=float(settings.get("offset", 0.0)),
                     subdivision=int(settings.get("subdivision", 16)),
                     channel=str(settings.get("bms_channel", "01")),
-                    wav_prefix=relative_sample_prefix(bms_path, target / "keysounds"),
+                    wav_prefix=relative_sample_prefix_for_export(bms_path, target / "keysounds"),
                 ))
             if export_bmson:
                 bmson_path = target / "keysounds" / f"{path.stem}.bmson"
-                exported["bmson"] = str(write_bmson(bmson_path, result.plan, bpm=settings.get("bpm"), offset=float(settings.get("offset", 0.0))))
+                exported["bmson"] = str(write_bmson(
+                    bmson_path,
+                    result.plan,
+                    bpm=settings.get("bpm"),
+                    offset=float(settings.get("offset", 0.0)),
+                    wav_prefix=relative_sample_prefix_for_export(bmson_path, target / "keysounds"),
+                ))
+            result.settings["exports"] = dict(exported)
+            # JSON is one of the artifacts being validated; write a first
+            # snapshot so ``json_written`` is meaningful, then refresh it
+            # below with the final validation payload.
+            write_json(json_path, result.to_dict())
             validation = validate_exports(result, exported)
             result.settings["validation"] = validation
-            result.settings["exports"] = dict(exported)
             write_json(json_path, result.to_dict())
             item.update({"ok": bool(validation.get("ok", False)), "outputs": exported, "summary": result.summary, "validation": validation})
         except Exception as exc:  # batch intentionally continues after one bad input

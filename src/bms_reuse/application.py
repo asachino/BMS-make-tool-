@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -19,14 +20,33 @@ from .classification.classifier import (
 from .clustering.recluster import recluster_plan
 from .clustering.reuse_plan import Cluster, ReusePlan, build_reuse_plan
 from .detection.onset import BPM_SNAP_TOLERANCE_MS, detect_onsets
+from .detection.loop_rules import build_cut_onsets, normalize_loop_rule, pattern_points
 from .extraction.hit_extractor import Hit, extract_hits
+from .features.automation import detect_automation
 from .features.feature_extractor import extract_features
+from .features.percussion import INSTRUMENT_BANDS, instruments_compatible, normalize_instrument
 from .project.model import Project
 from .similarity.score import SimilarityReport, compare_hits
 from .audio.loader import load_audio, mono_signal
 
 
-ANALYSIS_VERSION = "0.3.0"
+ANALYSIS_VERSION = "0.4.0"
+
+
+def relative_sample_prefix_for_export(
+    export_path: str | Path,
+    sample_dir: str | Path | None,
+) -> str:
+    """Return the relative representative-WAV prefix for any chart export.
+
+    BMS and BMSON resolve sample names from the chart directory.  Keeping this
+    small adapter in the application layer gives CLI, batch, and GUI callers a
+    single path calculation and avoids silently assuming that the chart and
+    keysound folder share a directory.
+    """
+    from .export.bms_exporter import relative_sample_prefix
+
+    return relative_sample_prefix(export_path, sample_dir)
 
 
 @dataclass
@@ -43,9 +63,28 @@ class AnalysisResult:
     @property
     def summary(self) -> dict:
         counts = Counter(report.classification for report in self.comparisons)
+        active_ids_raw = self.settings.get("active_hit_ids") if isinstance(self.settings, dict) else None
+        try:
+            active_ids = [int(value) for value in active_ids_raw] if isinstance(active_ids_raw, list) else None
+        except (TypeError, ValueError):
+            active_ids = None
+        detected_hits = len(active_ids) if active_ids is not None else len(self.hits)
+        active_set = set(active_ids) if active_ids is not None else {int(hit.id) for hit in self.hits}
+        automation_counts = Counter(
+            flag
+            for hit in self.hits
+            if int(hit.id) in active_set
+            for flag in (hit.automation or {}).get("flags", [])
+        )
+        variation_counts = Counter(
+            variation
+            for hit in self.hits
+            if int(hit.id) in active_set
+            for variation in (hit.automation or {}).get("variations", [])
+        )
         return {
             "duration_seconds": round(self.duration, 6),
-            "detected_hits": len(self.hits),
+            "detected_hits": detected_hits,
             "same": counts.get("SAME", 0),
             "gain_variants": counts.get("GAIN_VARIANT", 0),
             "different": counts.get("DIFFERENT", 0),
@@ -53,13 +92,19 @@ class AnalysisResult:
             "overlap": counts.get("OVERLAP", 0),
             "overlap_warnings": sum(bool(report.overlap_warning) for report in self.comparisons),
             "required_samples": self.plan.required_samples,
-            "reuse_ratio": round((1.0 - self.plan.required_samples / len(self.hits)) * 100.0, 2) if self.hits else 0.0,
+            "reuse_ratio": round((1.0 - self.plan.required_samples / detected_hits) * 100.0, 2) if detected_hits else 0.0,
             "comparisons": len(self.comparisons),
             "comparison_cache_hits": int(self.settings.get("comparison_cache_hits", 0)),
             "compare_mode": self.settings.get("compare_mode", "normal"),
             "recluster_profile": self.settings.get("recluster_profile", "balanced"),
             "recluster_thresholds": dict(self.settings.get("recluster_thresholds", {})),
             "timings": dict(self.settings.get("timings", {})),
+            "instrument": self.settings.get("instrument", "kick"),
+            "automation_hits": sum(bool((hit.automation or {}).get("flags")) for hit in self.hits if int(hit.id) in active_set),
+            "automation_flags": dict(sorted(automation_counts.items())),
+            "variations": dict(sorted(variation_counts.items())),
+            "loop_rule": self.settings.get("loop_rule", "off"),
+            "loop_boundaries": list(self.settings.get("loop_boundaries_sec", [])),
         }
 
     def to_dict(self) -> dict:
@@ -106,12 +151,25 @@ class AnalysisResult:
                 "settings_hash": repro.get("settings_hash", settings.get("settings_hash", "")),
                 "grid": grid,
                 "recluster": recluster,
+                "instrument": settings.get("instrument", "kick"),
+                "instrument_profile": settings.get("instrument_profile", {}),
+                "loop": {
+                    "rule": settings.get("loop_rule", "off"),
+                    "boundaries_sec": list(settings.get("loop_boundaries_sec", [])),
+                },
+                "cut_plan": settings.get("cut_plan", {}),
+                "automation": {
+                    "enabled": bool(settings.get("automation_detection", True)),
+                    "flags": self.summary.get("automation_flags", {}),
+                    "variations": self.summary.get("variations", {}),
+                },
             },
             "recluster": recluster,
             "review": {
                 "overrides": settings.get("review_overrides", {}),
                 "targets": settings.get("review_targets", {}),
                 "excluded_hits": settings.get("excluded_hits", []),
+                "active_hit_ids": settings.get("active_hit_ids", [int(hit.id) for hit in self.hits]),
             },
             "validation": settings.get("validation", {}),
             "exports": settings.get("exports", {}),
@@ -188,10 +246,14 @@ def _safe_int(value) -> int | None:
         return None
 
 
-def exclude_hit(result: AnalysisResult, hit_id: int) -> None:
-    """Remove one reviewed hit from the reusable plan and all exports."""
+def exclude_hit(result: AnalysisResult, hit_id: int, *, preserve_hit: bool = False) -> None:
+    """Exclude one reviewed hit; ``preserve_hit`` keeps it for reversible review."""
     hit_id = int(hit_id)
-    result.hits[:] = [hit for hit in result.hits if hit.id != hit_id]
+    active_ids = result.settings.setdefault("active_hit_ids", [int(hit.id) for hit in result.hits])
+    if isinstance(active_ids, list):
+        result.settings["active_hit_ids"] = [int(value) for value in active_ids if int(value) != hit_id]
+    if not preserve_hit:
+        result.hits[:] = [hit for hit in result.hits if hit.id != hit_id]
     result.comparisons[:] = [
         report for report in result.comparisons
         if report.reference_id != hit_id and report.candidate_id != hit_id
@@ -231,6 +293,11 @@ def exclude_hit(result: AnalysisResult, hit_id: int) -> None:
         excluded.append(hit_id)
     overrides = result.settings.setdefault("review_overrides", {})
     overrides[str(hit_id)] = "I"
+    result.settings["automation_changes"] = [
+        int(hit.id) for hit in result.hits
+        if int(hit.id) in {int(value) for value in result.settings.get("active_hit_ids", [])}
+        and ((hit.automation or {}).get("flags") or (hit.automation or {}).get("variations"))
+    ]
     refresh_reproducibility(result)
 
 
@@ -246,7 +313,7 @@ def analysis_result_from_dict(data: dict) -> AnalysisResult:
         raise ValueError("解析JSONの形式が不正です")
     settings = dict(data.get("settings") or {})
     review = data.get("review") or {}
-    for key in ("review_overrides", "review_targets", "excluded_hits"):
+    for key in ("review_overrides", "review_targets", "excluded_hits", "active_hit_ids"):
         review_key = key.removeprefix("review_")
         if key not in settings and review_key in review:
             settings[key] = review[review_key]
@@ -261,9 +328,26 @@ def analysis_result_from_dict(data: dict) -> AnalysisResult:
         settings["exports"] = exports
     if "validation" in data and "validation" not in settings:
         settings["validation"] = data["validation"]
+    metadata = data.get("metadata") or {}
+    if isinstance(metadata, dict):
+        if "instrument" in metadata and "instrument" not in settings:
+            settings["instrument"] = metadata["instrument"]
+        if "instrument_profile" in metadata and "instrument_profile" not in settings:
+            settings["instrument_profile"] = metadata["instrument_profile"]
+        loop = metadata.get("loop") or {}
+        if isinstance(loop, dict):
+            if "rule" in loop and "loop_rule" not in settings:
+                settings["loop_rule"] = loop["rule"]
+            if "boundaries_sec" in loop and "loop_boundaries_sec" not in settings:
+                settings["loop_boundaries_sec"] = loop["boundaries_sec"]
+        if "cut_plan" in metadata and "cut_plan" not in settings:
+            settings["cut_plan"] = metadata["cut_plan"]
     hits = []
     for raw in data.get("hits", []):
         raw = dict(raw)
+        automation = dict(raw.get("automation") or {})
+        if "variations" in raw and "variations" not in automation:
+            automation["variations"] = list(raw.get("variations") or [])
         hits.append(Hit(
             int(raw.get("id", len(hits))),
             int(raw.get("sample", raw.get("onset_sample", 0))),
@@ -273,12 +357,20 @@ def analysis_result_from_dict(data: dict) -> AnalysisResult:
             int(raw.get("source_end", 0)),
             bool(raw.get("overlap_warning", False)),
             dict(raw.get("features") or {}),
+            str(raw.get("instrument", settings.get("instrument", "kick"))),
+            automation,
+            raw.get("segment_index"),
+            str(raw.get("segment_rule", settings.get("loop_rule", "off"))),
         ))
+    if "active_hit_ids" not in settings:
+        excluded_ids = {int(value) for value in (settings.get("excluded_hits", []) or [])}
+        settings["active_hit_ids"] = [int(hit.id) for hit in hits if int(hit.id) not in excluded_ids]
     comparisons = []
     report_fields = {
         "reference_id", "candidate_id", "raw_similarity", "gain_normalized_similarity",
         "gain_db", "spectral_similarity", "attack_similarity", "body_similarity",
         "tail_similarity", "alignment_samples", "overlap_warning", "classification", "confidence",
+        "instrument_compatible",
     }
     for raw in data.get("comparisons", []):
         values = {key: raw[key] for key in report_fields if key in raw}
@@ -296,6 +388,7 @@ def analysis_result_from_dict(data: dict) -> AnalysisResult:
                 bool(values.get("overlap_warning", False)),
                 str(values.get("classification", "UNSURE")),
                 float(values.get("confidence", 0.0)),
+                bool(values.get("instrument_compatible", True)),
             ))
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("解析JSONのcomparison形式が不正です") from exc
@@ -344,6 +437,10 @@ def _update_review_targets(result: AnalysisResult) -> None:
 
 def _refresh_recluster_exports(result: AnalysisResult, *, reexport: bool) -> None:
     """Keep existing export references aligned with the new cluster IDs."""
+    excluded = {
+        int(hit_id)
+        for hit_id in (result.settings.get("excluded_hits", []) or [])
+    }
     exports = result.settings.get("exports")
     if not isinstance(exports, dict):
         return
@@ -370,7 +467,7 @@ def _refresh_recluster_exports(result: AnalysisResult, *, reexport: bool) -> Non
         return
     try:
         from .audio.loader import load_audio
-        from .export.bms_exporter import relative_sample_prefix, write_bms
+        from .export.bms_exporter import write_bms
         from .export.bmson_exporter import write_bmson
         from .export.csv_exporter import write_hits_csv
         from .export.json_exporter import write_json
@@ -397,7 +494,7 @@ def _refresh_recluster_exports(result: AnalysisResult, *, reexport: bool) -> Non
                 if stale.name.startswith("sample_") and stale.suffix.casefold() == ".wav":
                     stale.unlink(missing_ok=True)
         if exports.get("csv"):
-            write_hits_csv(exports["csv"], result.hits, result.plan.events)
+            write_hits_csv(exports["csv"], result.hits, result.plan.events, excluded_hits=excluded)
         if exports.get("bms"):
             write_bms(
                 exports["bms"],
@@ -406,7 +503,8 @@ def _refresh_recluster_exports(result: AnalysisResult, *, reexport: bool) -> Non
                 offset=float(result.settings.get("offset", 0.0)),
                 subdivision=int(result.settings.get("subdivision", 16)),
                 channel=str(result.settings.get("bms_channel", "01")),
-                wav_prefix=relative_sample_prefix(exports["bms"], samples_dir),
+                wav_prefix=relative_sample_prefix_for_export(exports["bms"], samples_dir),
+                excluded_hits=excluded,
             )
         if exports.get("bmson"):
             write_bmson(
@@ -414,7 +512,14 @@ def _refresh_recluster_exports(result: AnalysisResult, *, reexport: bool) -> Non
                 result.plan,
                 bpm=result.settings.get("bpm"),
                 offset=float(result.settings.get("offset", 0.0)),
+                wav_prefix=relative_sample_prefix_for_export(exports["bmson"], samples_dir),
+                excluded_hits=excluded,
             )
+        if exports.get("json"):
+            # The JSON artifact itself is part of validation, so create it
+            # before checking the complete export set.  Write it again below
+            # after attaching the final validation result.
+            write_json(exports["json"], result.to_dict())
         result.settings["exports"] = exports
         result.settings["validation"] = validate_exports(result, exports)
         if exports.get("json"):
@@ -445,6 +550,29 @@ def recluster_result(
     after clusters, events, comparisons, review targets, exports and hashes
     are updated.  Set ``reexport=False`` to update JSON metadata only.
     """
+    stored_active = result.settings.get("active_hit_ids")
+    try:
+        instrument = normalize_instrument(result.settings.get("instrument", "kick"))
+    except ValueError:
+        instrument = "other"
+    result.settings["instrument"] = instrument
+    result.settings.setdefault("instrument_profile_name", instrument)
+    result.settings.setdefault(
+        "instrument_profile",
+        {
+            "name": instrument,
+            "bands_hz": {
+                "low": float(INSTRUMENT_BANDS[instrument][0]),
+                "mid": float(INSTRUMENT_BANDS[instrument][1]),
+                "high": float(INSTRUMENT_BANDS[instrument][2]),
+            },
+        },
+    )
+    if isinstance(stored_active, list):
+        stored_active_set = {int(value) for value in stored_active}
+        existing_excluded = set(int(value) for value in (result.settings.get("excluded_hits", []) or []))
+        existing_excluded.update(int(hit.id) for hit in result.hits if int(hit.id) not in stored_active_set)
+        result.settings["excluded_hits"] = sorted(existing_excluded)
     plan, comparisons, profile_name, thresholds = recluster_plan(
         result.hits,
         result.comparisons,
@@ -462,7 +590,22 @@ def recluster_result(
     }
     overrides = result.settings.get("review_overrides", {}) or {}
     excluded.update(int(hit_id) for hit_id, value in overrides.items() if str(value).upper() == "I")
-    result.hits[:] = [hit for hit in result.hits if int(hit.id) not in excluded]
+    if isinstance(stored_active, list):
+        stored_active_set = {int(value) for value in stored_active}
+        excluded.update(int(hit.id) for hit in result.hits if int(hit.id) not in stored_active_set)
+    all_hit_ids = [int(hit.id) for hit in result.hits]
+    result.settings["active_hit_ids"] = [hit_id for hit_id in all_hit_ids if hit_id not in excluded]
+    active_ids = set(result.settings["active_hit_ids"])
+    result.settings["variations"] = sorted({
+        str(variation)
+        for hit in result.hits
+        if int(hit.id) in active_ids
+        for variation in (hit.automation or {}).get("variations", [])
+    })
+    result.settings["automation_changes"] = [
+        int(hit.id) for hit in result.hits
+        if int(hit.id) in active_ids and ((hit.automation or {}).get("flags") or (hit.automation or {}).get("variations"))
+    ]
     result.plan = plan
     result.comparisons[:] = comparisons
     result.settings["excluded_hits"] = sorted(excluded)
@@ -489,6 +632,89 @@ def recluster_result(
     refresh_reproducibility(result)
     _refresh_recluster_exports(result, reexport=reexport)
     return result
+
+
+def set_review_state(
+    result: AnalysisResult,
+    hit_id: int,
+    state: str | None,
+    *,
+    target_cluster: int | None = None,
+    reexport: bool = True,
+) -> AnalysisResult:
+    """Apply one review decision and rebuild the complete reuse plan.
+
+    ``S``/``G``/``D``/``I`` are the persisted review states.  Passing ``None``
+    (or ``ACTIVE``/``RESTORE``) clears the override and restores an ignored hit
+    to the active set.  The rebuild path updates clusters, representatives,
+    events, comparisons, exports, validation, and reproducibility hashes in a
+    single operation; GUI callers should use this instead of editing a plan
+    member in place.
+    """
+    hit_id = int(hit_id)
+    if not any(int(hit.id) == hit_id for hit in result.hits):
+        raise ValueError(f"hit {hit_id} is not present in the analysis")
+    normalized = None if state is None else str(state).strip().upper()
+    if normalized in {"", "A", "ACTIVE", "RESTORE", "R"}:
+        normalized = None
+    if normalized not in {None, "S", "G", "D", "I"}:
+        raise ValueError("review state must be S, G, D, I, or ACTIVE")
+    settings = result.settings
+    overrides = dict(settings.get("review_overrides", {}) or {})
+    targets = dict(settings.get("review_targets", {}) or {})
+    excluded = {int(value) for value in (settings.get("excluded_hits", []) or [])}
+    all_ids = {int(hit.id) for hit in result.hits}
+    active_values = settings.get("active_hit_ids")
+    if active_values is None:
+        active_values = all_ids
+    active = {
+        int(value) for value in active_values
+        if _safe_int(value) in all_ids
+    }
+    key = str(hit_id)
+    if normalized is None:
+        overrides.pop(key, None)
+        overrides.pop(hit_id, None)
+        excluded.discard(hit_id)
+        active.add(hit_id)
+        # A stale manual target should not influence a restored automatic
+        # decision.  A new target can be supplied explicitly below.
+        targets.pop(key, None)
+        targets.pop(hit_id, None)
+    else:
+        overrides[key] = normalized
+        overrides.pop(hit_id, None)
+        if normalized == "I":
+            excluded.add(hit_id)
+            active.discard(hit_id)
+            targets.pop(key, None)
+            targets.pop(hit_id, None)
+        else:
+            excluded.discard(hit_id)
+            active.add(hit_id)
+            if normalized == "D":
+                targets.pop(key, None)
+                targets.pop(hit_id, None)
+    if target_cluster is not None and normalized in {"S", "G"}:
+        targets[key] = int(target_cluster)
+    settings["review_overrides"] = overrides
+    settings["review_targets"] = targets
+    settings["excluded_hits"] = sorted(excluded)
+    settings["active_hit_ids"] = sorted(active)
+    return recluster_result(
+        result,
+        profile=settings.get("recluster_profile", "balanced"),
+        reexport=reexport,
+    )
+
+
+def refresh_review_plan(result: AnalysisResult, *, reexport: bool = True) -> AnalysisResult:
+    """Rebuild a result after persisted review settings were edited."""
+    return recluster_result(
+        result,
+        profile=result.settings.get("recluster_profile", "balanced"),
+        reexport=reexport,
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -523,6 +749,19 @@ def analyze_file(
     fade_out_ms: float = 0.0,
     fast_compare: bool = False,
     bms_channel: str = "01",
+    loop_rule: str = "off",
+    loop_seconds: float | None = None,
+    loop_beats: float | None = None,
+    loop_bars: float | None = None,
+    loop_start_sec: float = 0.0,
+    loop_points: list[float] | tuple[float, ...] | None = None,
+    automation_detection: bool = True,
+    automation_volume_threshold_db: float = 3.0,
+    automation_timbre_threshold: float = 0.18,
+    automation_pan_threshold_db: float = 3.0,
+    automation_chop_floor: float = 0.08,
+    cut_plan: str | dict | None = None,
+    loop_pattern: list[float] | tuple[float, ...] | None = None,
 ) -> AnalysisResult:
     analysis_started = time.perf_counter()
 
@@ -533,6 +772,37 @@ def analyze_file(
             progress(percent, message)
 
     path = Path(path)
+    instrument = normalize_instrument(instrument)
+    if str(loop_rule).strip().casefold() == "grid" and loop_beats is None:
+        loop_beats = 1.0 / max(1, int(subdivision))
+    loop_rule = normalize_loop_rule(loop_rule)
+    cut_plan_mode = "auto"
+    cut_plan_data = {}
+    if cut_plan is not None:
+        cut_plan_data = dict(cut_plan) if isinstance(cut_plan, dict) else {"mode": str(cut_plan)}
+        cut_plan_mode = str(cut_plan_data.get("mode", "auto")).strip().casefold()
+        if cut_plan_mode not in {"auto", "grid", "manual", "pattern"}:
+            raise ValueError("cut_plan mode must be auto, grid, manual, or pattern")
+        if cut_plan_mode == "auto":
+            loop_rule = "off"
+        elif cut_plan_mode == "manual":
+            loop_rule = "points"
+            loop_points = cut_plan_data.get("points", cut_plan_data.get("boundaries_sec", loop_points))
+        elif cut_plan_mode == "pattern":
+            loop_rule = "points"
+            loop_pattern = cut_plan_data.get("intervals", cut_plan_data.get("pattern", loop_pattern))
+        elif cut_plan_mode == "grid" and loop_rule == "off":
+            loop_rule = str(cut_plan_data.get("rule", "beats"))
+            if loop_rule == "beats" and loop_beats is None:
+                loop_beats = cut_plan_data.get("beats", 1.0)
+            if loop_rule == "bars" and loop_bars is None:
+                loop_bars = cut_plan_data.get("bars", 1.0)
+        loop_rule = normalize_loop_rule(loop_rule)
+    if cut_plan is None and loop_rule != "off":
+        cut_plan_mode = "manual" if loop_rule == "points" else "grid"
+    if cut_plan is None and loop_pattern:
+        cut_plan_mode = "pattern"
+        loop_rule = "points"
     if not 0.0 <= threshold <= 1.0 or not 0.0 <= spectral_threshold <= 1.0:
         raise ValueError("threshold and spectral_threshold must be between 0 and 1")
     if min_interval_sec is not None:
@@ -549,6 +819,20 @@ def analyze_file(
         raise ValueError("margin_percent must be between 0 and 100")
     if fade_in_ms < 0 or fade_out_ms < 0:
         raise ValueError("fade durations must be non-negative")
+    if loop_start_sec < 0:
+        raise ValueError("loop_start_sec must be non-negative")
+    for name, value in (
+        ("automation_volume_threshold_db", automation_volume_threshold_db),
+        ("automation_timbre_threshold", automation_timbre_threshold),
+        ("automation_pan_threshold_db", automation_pan_threshold_db),
+        ("automation_chop_floor", automation_chop_floor),
+    ):
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a number") from exc
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and non-negative")
     if onset_threshold < 0 or min_separation_ms <= 0 or pre_roll_ms < 0 or window_ms <= 0 or max_alignment_ms < 0:
         raise ValueError("analysis timing values are out of range")
     if bpm is not None and bpm <= 0:
@@ -572,6 +856,8 @@ def analyze_file(
     report(5, "Loading audio")
     audio = load_audio(path)
     mono = mono_signal(audio)
+    if cut_plan_mode == "pattern":
+        loop_points = pattern_points(loop_pattern, loop_start_sec, audio.duration)
     timings["load_seconds"] = round(time.perf_counter() - stage_started, 6)
     stage_started = time.perf_counter()
     report(18, "Detecting onsets")
@@ -583,6 +869,18 @@ def analyze_file(
         bpm=bpm,
         offset=offset,
         subdivision=subdivision,
+    )
+    onsets, loop_boundaries = build_cut_onsets(
+        onsets,
+        audio.frame_count,
+        audio.sample_rate,
+        rule=loop_rule,
+        seconds=loop_seconds,
+        beats=loop_beats,
+        bars=loop_bars,
+        bpm=bpm,
+        start_sec=loop_start_sec,
+        points=loop_points,
     )
     timings["onset_seconds"] = round(time.perf_counter() - stage_started, 6)
     stage_started = time.perf_counter()
@@ -603,7 +901,29 @@ def analyze_file(
     for index, hit in enumerate(hits):
         if is_cancelled and is_cancelled():
             raise AnalysisCancelled()
-        hit.features = extract_features(hit.samples, audio.sample_rate)
+        hit.instrument = instrument
+        hit.segment_index = index
+        hit.segment_rule = loop_rule
+        hit.features = extract_features(hit.samples, audio.sample_rate, instrument=instrument)
+        if automation_detection:
+            channel_slice = audio.samples[hit.source_start:hit.source_end]
+            hit.automation = detect_automation(
+                hit.samples,
+                audio.sample_rate,
+                channels=channel_slice,
+                volume_threshold_db=automation_volume_threshold_db,
+                timbre_threshold=automation_timbre_threshold,
+                pan_threshold_db=automation_pan_threshold_db,
+                chop_floor=automation_chop_floor,
+            )
+            if bpm and subdivision > 0:
+                grid_step = 60.0 / float(bpm) / int(subdivision)
+                grid_time = float(offset) + round((hit.time - float(offset)) / grid_step) * grid_step
+                if abs(grid_time - hit.time) > BPM_SNAP_TOLERANCE_MS / 1000.0:
+                    hit.automation.setdefault("flags", []).append("off_grid")
+                    hit.automation.setdefault("variations", []).append("OFF_GRID")
+        else:
+            hit.automation = {}
         if hits:
             report(30 + round((index + 1) / len(hits) * 20), f"Extracting features {index + 1}/{len(hits)}")
     timings["feature_seconds"] = round(time.perf_counter() - stage_started, 6)
@@ -616,15 +936,19 @@ def analyze_file(
         reference_fingerprint = fingerprints[reference.id]
         candidate_fingerprint = fingerprints[candidate.id]
         overlap = bool(getattr(reference, "overlap_warning", False) or getattr(candidate, "overlap_warning", False))
-        if reference_fingerprint == candidate_fingerprint:
-            key = reference_fingerprint + (overlap,)
+        instrument_pair = (
+            str(getattr(reference, "instrument", "kick")),
+            str(getattr(candidate, "instrument", "kick")),
+        )
+        if reference_fingerprint == candidate_fingerprint and instruments_compatible(*instrument_pair):
+            key = reference_fingerprint + (overlap,) + instrument_pair
             for cached_samples, cached_report in exact_report_cache.get(key, []):
                 if _samples_equal(cached_samples, candidate.samples) and _samples_equal(cached_samples, reference.samples):
                     cache_stats["hits"] += 1
                     return replace(cached_report, reference_id=reference.id, candidate_id=candidate.id)
         report = compare_hits(reference, candidate, audio.sample_rate, max_alignment_ms=max_alignment_ms)
-        if reference_fingerprint == candidate_fingerprint:
-            key = reference_fingerprint + (overlap,)
+        if reference_fingerprint == candidate_fingerprint and instruments_compatible(*instrument_pair):
+            key = reference_fingerprint + (overlap,) + instrument_pair
             exact_report_cache.setdefault(key, []).append((reference.samples, replace(report)))
             cache_stats["entries"] += 1
         return report
@@ -651,8 +975,15 @@ def analyze_file(
         progress_detail=report_compare_detail,
         is_cancelled=is_cancelled,
         fast_compare=fast_compare,
-        reuse_key=lambda hit: fingerprints[hit.id] + (bool(getattr(hit, "overlap_warning", False)),),
-        reuse_equal=lambda left, right: _samples_equal(left.samples, right.samples) and bool(getattr(left, "overlap_warning", False)) == bool(getattr(right, "overlap_warning", False)),
+        reuse_key=lambda hit: fingerprints[hit.id] + (
+            bool(getattr(hit, "overlap_warning", False)),
+            str(getattr(hit, "instrument", "kick")),
+        ),
+        reuse_equal=lambda left, right: (
+            _samples_equal(left.samples, right.samples)
+            and bool(getattr(left, "overlap_warning", False)) == bool(getattr(right, "overlap_warning", False))
+            and instruments_compatible(getattr(left, "instrument", "kick"), getattr(right, "instrument", "kick"))
+        ),
         cache_hit=lambda: cache_stats.__setitem__("hits", cache_stats["hits"] + 1),
     )
     timings["compare_seconds"] = round(time.perf_counter() - stage_started, 6)
@@ -682,6 +1013,43 @@ def analyze_file(
         "fade_in_ms": fade_in_ms,
         "fade_out_ms": fade_out_ms,
         "bms_channel": bms_channel,
+        "instrument_profile": {
+            "name": instrument,
+            "bands_hz": {
+                "low": float(INSTRUMENT_BANDS[instrument][0]),
+                "mid": float(INSTRUMENT_BANDS[instrument][1]),
+                "high": float(INSTRUMENT_BANDS[instrument][2]),
+            },
+        },
+        "instrument_profile_name": instrument,
+        "loop_rule": loop_rule,
+        "loop_seconds": loop_seconds,
+        "loop_beats": loop_beats,
+        "loop_bars": loop_bars,
+        "loop_start_sec": loop_start_sec,
+        "loop_points": [float(value) for value in (loop_points or [])],
+        "loop_pattern": [float(value) for value in (loop_pattern or [])],
+        "loop_boundaries_sec": loop_boundaries,
+        "cut_plan": {
+            "mode": cut_plan_mode,
+            "rule": loop_rule,
+            "boundaries_sec": loop_boundaries,
+            "pattern": [float(value) for value in (loop_pattern or [])],
+        },
+        "automation_detection": bool(automation_detection),
+        "automation_volume_threshold_db": float(automation_volume_threshold_db),
+        "automation_timbre_threshold": float(automation_timbre_threshold),
+        "automation_pan_threshold_db": float(automation_pan_threshold_db),
+        "automation_chop_floor": float(automation_chop_floor),
+        "automation_changes": [
+            int(hit.id) for hit in hits if (hit.automation or {}).get("flags") or (hit.automation or {}).get("variations")
+        ],
+        "active_hit_ids": [int(hit.id) for hit in hits],
+        "variations": sorted({
+            str(variation)
+            for hit in hits
+            for variation in (hit.automation or {}).get("variations", [])
+        }),
         "recluster_profile": "balanced",
         "recluster_thresholds": {
             "waveform": threshold,

@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 
 from ..extraction.alignment import align_pair
 from ..features.spectral import spectral_similarity
+from ..features.percussion import instruments_compatible
 from ..features.waveform import waveform_similarity
 
 
@@ -24,6 +25,7 @@ class SimilarityReport:
     overlap_warning: bool = False
     classification: str = "UNSURE"
     confidence: float = 0.0
+    instrument_compatible: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -46,6 +48,10 @@ def compare_hits(reference, candidate, sample_rate: int, *, max_alignment_ms: fl
     tail = _window_similarity(ref_samples, candidate_samples, body_end, n)
     spectral = spectral_similarity(ref_samples, candidate_samples)
     overlap = bool(getattr(reference, "overlap_warning", False) or getattr(candidate, "overlap_warning", False))
+    compatible = instruments_compatible(
+        getattr(reference, "instrument", "kick"),
+        getattr(candidate, "instrument", "kick"),
+    )
     return SimilarityReport(
         reference.id,
         candidate.id,
@@ -58,4 +64,5 @@ def compare_hits(reference, candidate, sample_rate: int, *, max_alignment_ms: fl
         tail,
         shift,
         overlap,
+        instrument_compatible=compatible,
     )

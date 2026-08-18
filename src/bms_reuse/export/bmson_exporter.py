@@ -16,9 +16,10 @@ def _sample_filename(prefix: str, sample_id: str) -> str:
     if prefix.endswith("_") and "/" not in prefix and "\\" not in prefix:
         return f"{prefix}{number:03d}.wav"
     directory = Path(prefix.replace("\\", "/")).as_posix().rstrip("/")
-    # Keep the reference portable.  BMSON players resolve this basename beside
-    # the chart; the GUI/batch exporters put the chart in the keysound folder.
-    return Path(f"{directory + '/' if directory and directory != '.' else ''}sample_{number:03d}.wav").name
+    # Preserve a caller-supplied relative directory.  BMSON resolves sound
+    # channel names relative to the chart, so dropping this part would make an
+    # externally placed chart point at the wrong WAV folder.
+    return f"{directory + '/' if directory and directory != '.' else ''}sample_{number:03d}.wav"
 
 
 def write_bmson(

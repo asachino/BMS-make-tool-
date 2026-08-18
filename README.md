@@ -53,7 +53,7 @@ dist\bms-reuse.exe analyze kick_stem.wav `
   --bpm 174 --bms chart.bms --bmson keysounds\chart.bmson
 ```
 
-BMSONの音声名はチャートから見たbasenameなので、BMSONは代表WAVと同じフォルダに出力します。BMSは`--bms-channel 01`（BGM互換、警告付き）が既定で、プレイ可能なキー音には`11`以降を指定できます。
+BMSON/BMSの音声名はチャートから見た相対パスです。代表WAVを別フォルダへ出力しても、CLI・batch・GUIはそのフォルダへの相対参照を自動生成します。BMSは`--bms-channel 01`（BGM互換、警告付き）が既定で、プレイ可能なキー音には`11`以降を指定できます。
 
 フォルダ一括解析:
 
@@ -74,6 +74,21 @@ dist\bms-reuse.exe recluster project.bra.json `
 
 `--reuse-level` は `strict` / `balanced` / `aggressive` または `0.0`〜`1.0` の連続閾値です。`--threshold` と `--spectral-threshold` で個別指定もできます。既存のS/G/D/Iレビューは優先され、I除外はヒット・比較・クラスタ・イベント・代表WAV数に反映されます。
 
-GUIから呼ぶ最小APIは `bms_reuse.recluster_result(result, reuse_level="balanced")` です。同じ`AnalysisResult`を更新して返し、`result.plan.clusters`（代表1つ/クラスタ）、`result.plan.events`（非除外ヒット1件/イベント）、`result.summary`、`result.settings["exports"]`、`result.settings["recluster_thresholds"]`を同期します。`reexport=False`ならJSON/メタデータだけ更新します。
+GUIから呼ぶ最小APIは `bms_reuse.recluster_result(result, reuse_level="balanced")` です。同じ`AnalysisResult`を更新して返し、`result.plan.clusters`（代表1つ/クラスタ）、`result.plan.events`（非除外ヒット1件/イベント）、`result.summary`、`result.settings["exports"]`、`result.settings["recluster_thresholds"]`を同期します。レビュー操作は `bms_reuse.set_review_state(result, hit_id, "S|G|D|I", target_cluster=...)` に集約でき、`None`（または`ACTIVE`）でIを復元します。`reexport=False`ならJSON/メタデータだけ更新します。
 
 schema v2 JSONには、`recluster.profile`、`recluster.thresholds`（waveform/spectral/gain_tolerance_db）、`review`、`exports`、`validation`が保存されます。再クラスタリングは保存された`comparisons`のスコアとヒットの`features`/座標だけをデータ契約として受け取ります。
+
+## 打楽器プロファイルとループ切断
+
+`--instrument kick|snare|hihat|other` は帯域比・トランジェント・減衰などの特徴量を保存し、異なる楽器同士が自動的に同じクラスタへ入ることを防ぎます。解析JSONの`settings.instrument_profile`と各ヒットの`features.instrument`で再現できます。
+
+ループ／刻みは既定の自動オンセット検出を保ったまま、秒・拍・小節・手動点・反復パターンへ切り替えられます。
+
+```powershell
+dist\bms-reuse.exe analyze stem.wav --instrument hihat `
+  --cut-plan grid --bpm 174 --loop-beats 1
+dist\bms-reuse.exe analyze loop.wav --cut-plan manual --loop-points 0,0.25,0.5,0.75
+dist\bms-reuse.exe analyze roll.wav --cut-plan pattern --loop-pattern 0.125,0.125,0.25
+```
+
+各ヒットには音量・音色・密度（切り刻み）・テール・ステレオ・グリッド外（`OFF_GRID`）変化の`automation.variations`が保存されます。これはレビュー用の警告で、類似クラスタを自動的に拒否するものではありません。旧APIの`loop_rule`／`loop_seconds`等も引き続き利用できます。

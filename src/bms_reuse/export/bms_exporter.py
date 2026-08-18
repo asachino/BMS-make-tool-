@@ -63,8 +63,21 @@ def _event_positions(events, *, bpm: float, offset: float, subdivision: int) -> 
             slot %= slots
         key = (measure, slot)
         if key in placed:
-            warnings.append(f"時刻{time:.6f}s: 同一グリッドに複数ノートがあるため後続を省略")
-            continue
+            original_key = key
+            # A BMS channel has one value per grid slot.  Move a collision to
+            # the next free slot instead of silently losing an event.  If a
+            # measure is full, continue at the first slot of the next one;
+            # the warning keeps the timing adjustment visible to the user.
+            while key in placed:
+                slot += 1
+                if slot >= slots:
+                    measure += 1
+                    slot = 0
+                key = (measure, slot)
+            warnings.append(
+                f"時刻{time:.6f}s: グリッド{original_key[0]}:{original_key[1]}が衝突したため"
+                f"次の空きグリッド{key[0]}:{key[1]}へ移動"
+            )
         placed[key] = event
     return placed, warnings
 
