@@ -22,7 +22,7 @@ class GuiSupportTest(unittest.TestCase):
         cls.app = create_app([])
 
     def test_rows_and_time_format_are_review_ready(self):
-        from bms_reuse.gui import classify_hits, format_seconds
+        from bms_reuse.gui import MainWindow, classify_hits, format_seconds
 
         self.assertEqual(format_seconds(65.25), "01:05.25")
         with tempfile.TemporaryDirectory() as directory:
@@ -36,6 +36,13 @@ class GuiSupportTest(unittest.TestCase):
             self.assertEqual(len(rows), result.summary["detected_hits"])
             self.assertEqual(rows[0]["classification"], "BASE")
             self.assertIn("sample_", rows[0]["sample_id"])
+            window = MainWindow()
+            window.result = result
+            window.rows = rows
+            window._select_hit(rows[0]["id"])
+            self.assertIn("正規化波形", window.detail_metrics.text())
+            self.assertIn("判定プロファイル 波形・スペクトル優先", window.detail_metrics.text())
+            window.close()
 
     def test_window_constructs_without_a_display(self):
         from bms_reuse.gui import CLASS_LABELS, MainWindow, localize_progress
@@ -53,6 +60,9 @@ class GuiSupportTest(unittest.TestCase):
         self.assertEqual(window.margin_spin.value(), 90.0)
         self.assertEqual(window.fade_in_spin.value(), 2.0)
         self.assertEqual(window.fade_out_spin.value(), 2.0)
+        self.assertEqual(window.threshold_spin.value(), 0.95)
+        self.assertEqual(window.spectral_spin.value(), 0.94)
+        self.assertEqual(window.alignment_spin.value(), 20.0)
         self.assertFalse(window.fast_compare_check.isChecked())
         self.assertEqual(window.filter_combo.itemData(2), "SAME")
         self.assertEqual(CLASS_LABELS["SAME"], "同一")
@@ -149,8 +159,14 @@ class GuiSupportTest(unittest.TestCase):
             self.assertAlmostEqual(settings["min_interval_sec"], 0.05)
             self.assertEqual(settings["fade_in_ms"], 2.0)
             self.assertEqual(settings["fade_out_ms"], 3.0)
+            self.assertEqual(settings["max_alignment_ms"], 20.0)
+            self.assertEqual(settings["bpm_snap_tolerance_ms"], 5.0)
             self.assertEqual(settings["compare_mode"], "normal")
             self.assertFalse(settings["fast_compare"])
+            self.assertEqual(settings["similarity_profile"]["name"], "waveform_spectral_v2")
+            self.assertEqual(settings["similarity_profile"]["waveform_threshold"], 0.95)
+            self.assertEqual(settings["similarity_profile"]["spectral_threshold"], 0.94)
+            self.assertEqual(settings["similarity_profile"]["alignment_ms"], 20.0)
 
             audio = load_audio(write_wav(Path(directory) / "tone.wav", [[1.0]] * 10, 1000))
             hit = Hit(1, 0, 0.0, audio.samples, 0, 10)

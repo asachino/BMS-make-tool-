@@ -34,7 +34,7 @@ def _window_similarity(reference, candidate, start: int, end: int) -> float:
     return normalized
 
 
-def compare_hits(reference, candidate, sample_rate: int, *, max_alignment_ms: float = 5.0) -> SimilarityReport:
+def compare_hits(reference, candidate, sample_rate: int, *, max_alignment_ms: float = 20.0) -> SimilarityReport:
     max_shift = max(0, round(sample_rate * max_alignment_ms / 1000.0))
     ref_samples, candidate_samples, shift = align_pair(reference.samples, candidate.samples, max_shift)
     raw, normalized, gain_db = waveform_similarity(ref_samples, candidate_samples)

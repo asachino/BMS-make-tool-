@@ -31,6 +31,8 @@ python gui_launcher.py
 
 出力は `dist\bms-reuse-gui.exe` です。GUIはWAVのドラッグ＆ドロップ、非同期解析、進捗とキャンセル、分類フィルタ、代表WAV/JSON/CSV出力に対応しています。`Ctrl+O`で入力選択、`Ctrl+Enter`で解析、`Esc`でキャンセル、`Space`で代表WAVを再生できます。
 
+類似度判定は位置合わせ後のゲイン正規化波形とスペクトルを優先し、微小ノイズや音量差を許容します。判定プロファイル、実効しきい値、位置合わせ幅、重なり警告は解析JSONに記録されます。
+
 PySide6はQt for PythonのLGPLv3/GPLv3または商用ライセンスの対象です。再配布時は利用するライセンスの条件とPySide6の著作権表示を確認してください。
 
 ## Run

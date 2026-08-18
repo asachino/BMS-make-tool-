@@ -240,6 +240,7 @@ def classify_hits(result: AnalysisResult) -> list[dict]:
                 "classification": classification,
                 "confidence": report.confidence if report else 100.0,
                 "gain_db": report.gain_db if report else 0.0,
+                "raw": report.raw_similarity if report else 1.0,
                 "spectral": report.spectral_similarity if report else 1.0,
                 "waveform": report.gain_normalized_similarity if report else 1.0,
                 "attack": report.attack_similarity if report else 1.0,
@@ -585,8 +586,8 @@ class MainWindow(QMainWindow):
         self.instrument_combo = QComboBox()
         for key, label in INSTRUMENT_LABELS.items():
             self.instrument_combo.addItem(label, key)
-        self.threshold_spin = self._double_spin(0.995, 0.0, 1.0, 0.001, 3)
-        self.spectral_spin = self._double_spin(0.92, 0.0, 1.0, 0.001, 3)
+        self.threshold_spin = self._double_spin(0.95, 0.0, 1.0, 0.001, 3)
+        self.spectral_spin = self._double_spin(0.94, 0.0, 1.0, 0.001, 3)
         self.onset_spin = self._double_spin(0.35, 0.0, 1.0, 0.01, 2)
         self.pre_roll_spin = self._double_spin(5.0, 0.0, 1000.0, 1.0, 0, " ms")
         self.window_spin = self._double_spin(800.0, 10.0, 10000.0, 10.0, 0, " ms")
@@ -612,7 +613,7 @@ class MainWindow(QMainWindow):
         self.fade_in_spin.setToolTip("書き出す代表WAVの先頭フェード（0で無効）")
         self.fade_out_spin.setToolTip("書き出す代表WAVの末尾フェード（0で無効）")
         self.offset_spin = self._double_spin(0.0, -60.0, 60.0, 0.001, 3, " s")
-        self.alignment_spin = self._double_spin(5.0, 0.0, 100.0, 0.5, 1, " ms")
+        self.alignment_spin = self._double_spin(20.0, 0.0, 100.0, 0.5, 1, " ms")
         self.subdivision_spin = QSpinBox()
         self.subdivision_spin.setRange(1, 128)
         self.subdivision_spin.setValue(16)
@@ -1084,6 +1085,18 @@ class MainWindow(QMainWindow):
                     total=timings.get("total_seconds", 0.0),
                 )
             )
+        profile = result.settings.get("similarity_profile", {})
+        profile_name = "波形・スペクトル優先" if profile.get("name") == "waveform_spectral_v2" else profile.get("name", "類似度優先")
+        self._log(
+            "類似度判定: {name} · 波形≥{waveform:.3f} · スペクトル≥{spectral:.3f} · "
+            "位置合わせ±{alignment:.1f}ms · 重なり警告{warnings}件".format(
+                name=profile_name,
+                waveform=float(profile.get("waveform_threshold", result.settings.get("threshold", 0.95))),
+                spectral=float(profile.get("spectral_threshold", result.settings.get("spectral_threshold", 0.94))),
+                alignment=float(profile.get("alignment_ms", result.settings.get("max_alignment_ms", 20.0))),
+                warnings=summary.get("overlap_warnings", 0),
+            )
+        )
         self._processing_stage = "解析完了"
         self.status_label.setText("解析結果を表示中")
 
@@ -1168,10 +1181,17 @@ class MainWindow(QMainWindow):
         label = CLASS_LABELS.get(row["classification"], row["classification"])
         self.detail_title.setText(f"ヒット {row['id']:03d}  ·  {label}")
         self.detail_title.setStyleSheet(f"color:{CLASS_COLORS.get(row['classification'], '#e5e7eb')};font-size:12pt;font-weight:700;")
+        profile = self.result.settings.get("similarity_profile", {}) if self.result else {}
+        profile_name = "波形・スペクトル優先" if profile.get("name") == "waveform_spectral_v2" else profile.get("name", "類似度優先")
+        warning = "  ·  警告: 音の重なり" if row["overlap"] else ""
         self.detail_metrics.setText(
-            f"時刻 {format_seconds(row['time'])}  ·  {row['sample_id']}  ·  信頼度 {row['confidence']:.1f}%  ·  音量差 {row['gain_db']:+.2f} dB\n"
-            f"波形 {row['waveform'] * 100:.2f}%   スペクトル {row['spectral'] * 100:.2f}%   "
-            f"アタック {row['attack'] * 100:.2f}%   ボディ {row['body'] * 100:.2f}%   テール {row['tail'] * 100:.2f}%"
+            f"時刻 {format_seconds(row['time'])}  ·  {row['sample_id']}  ·  信頼度 {row['confidence']:.1f}%  ·  音量差 {row['gain_db']:+.2f} dB{warning}\n"
+            f"正規化波形 {row['waveform'] * 100:.2f}%   生波形 {row['raw'] * 100:.2f}%   スペクトル {row['spectral'] * 100:.2f}%   "
+            f"アタック {row['attack'] * 100:.2f}%   ボディ {row['body'] * 100:.2f}%   テール {row['tail'] * 100:.2f}%\n"
+            f"判定プロファイル {profile_name}  ·  "
+            f"波形基準 {float(profile.get('waveform_threshold', 0.95)):.3f}  ·  "
+            f"スペクトル基準 {float(profile.get('spectral_threshold', 0.94)):.3f}  ·  "
+            f"位置合わせ ±{float(profile.get('alignment_ms', 20.0)):.1f}ms"
         )
 
     def _sample_path_for_selected(self) -> Path | None:

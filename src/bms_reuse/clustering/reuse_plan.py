@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable
 
-from ..classification.classifier import classify_report
+from ..classification.classifier import (
+    DEFAULT_SPECTRAL_THRESHOLD,
+    DEFAULT_WAVEFORM_THRESHOLD,
+    classify_report,
+)
 from ..similarity.score import SimilarityReport
 
 
@@ -88,8 +92,8 @@ def build_reuse_plan(
     hits,
     compare: Callable | Iterable[SimilarityReport],
     *,
-    threshold: float = 0.995,
-    spectral_threshold: float = 0.92,
+    threshold: float = DEFAULT_WAVEFORM_THRESHOLD,
+    spectral_threshold: float = DEFAULT_SPECTRAL_THRESHOLD,
     progress: Callable[[int, int], None] | None = None,
     progress_detail: Callable[[int, int, int], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,

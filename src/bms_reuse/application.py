@@ -9,9 +9,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
-from .classification.classifier import classify_report
+from .classification.classifier import (
+    DEFAULT_GAIN_TOLERANCE_DB,
+    DEFAULT_SPECTRAL_THRESHOLD,
+    DEFAULT_WAVEFORM_THRESHOLD,
+    SIMILARITY_PROFILE_NAME,
+)
 from .clustering.reuse_plan import ReusePlan, build_reuse_plan
-from .detection.onset import detect_onsets
+from .detection.onset import BPM_SNAP_TOLERANCE_MS, detect_onsets
 from .extraction.hit_extractor import extract_hits
 from .features.feature_extractor import extract_features
 from .project.model import Project
@@ -41,6 +46,7 @@ class AnalysisResult:
             "different": counts.get("DIFFERENT", 0),
             "unsure": counts.get("UNSURE", 0),
             "overlap": counts.get("OVERLAP", 0),
+            "overlap_warnings": sum(bool(report.overlap_warning) for report in self.comparisons),
             "required_samples": self.plan.required_samples,
             "reuse_ratio": round((1.0 - self.plan.required_samples / len(self.hits)) * 100.0, 2) if self.hits else 0.0,
             "comparisons": len(self.comparisons),
@@ -112,13 +118,13 @@ def analyze_file(
     path: str | Path,
     *,
     instrument: str = "kick",
-    threshold: float = 0.995,
-    spectral_threshold: float = 0.92,
+    threshold: float = DEFAULT_WAVEFORM_THRESHOLD,
+    spectral_threshold: float = DEFAULT_SPECTRAL_THRESHOLD,
     onset_threshold: float = 0.35,
     min_separation_ms: float = 50.0,
     pre_roll_ms: float = 5.0,
     window_ms: float = 800.0,
-    max_alignment_ms: float = 5.0,
+    max_alignment_ms: float = 20.0,
     bpm: float | None = None,
     offset: float = 0.0,
     subdivision: int = 16,
@@ -279,11 +285,21 @@ def analyze_file(
         "pre_roll_ms": pre_roll_ms,
         "window_ms": window_ms,
         "max_alignment_ms": max_alignment_ms,
+        "bpm_snap_tolerance_ms": BPM_SNAP_TOLERANCE_MS,
         "bpm": bpm,
         "offset": offset,
         "subdivision": subdivision,
         "fade_in_ms": fade_in_ms,
         "fade_out_ms": fade_out_ms,
+        "similarity_profile": {
+            "name": SIMILARITY_PROFILE_NAME,
+            "waveform_threshold": threshold,
+            "spectral_threshold": spectral_threshold,
+            "gain_tolerance_db": DEFAULT_GAIN_TOLERANCE_DB,
+            "alignment_ms": max_alignment_ms,
+            "raw_similarity_role": "auxiliary",
+            "overlap_policy": "similarity_first_warning",
+        },
         "compare_mode": "fast" if fast_compare else "normal",
         "fast_compare": bool(fast_compare),
         "comparison_count": len(comparisons),

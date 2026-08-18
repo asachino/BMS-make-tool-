@@ -8,6 +8,9 @@ from dataclasses import asdict, dataclass
 from .._numeric import np
 
 
+BPM_SNAP_TOLERANCE_MS = 5.0
+
+
 @dataclass(frozen=True)
 class Onset:
     id: int
@@ -140,13 +143,16 @@ def detect_onsets(
     times = [sample / sample_rate for sample in positions]
     if bpm and bpm > 0 and subdivision > 0:
         grid_step = 60.0 / bpm / subdivision
-        snapped: list[float] = []
-        for time in times:
+        snapped_positions: list[int] = []
+        for position, time in zip(positions, times):
             grid_time = offset + round((time - offset) / grid_step) * grid_step
-            if abs(grid_time - time) <= max(0.025, grid_step * 0.25):
-                snapped.append(max(0.0, grid_time))
+            # A broad grid tolerance can move a real attack tens of ms and
+            # then make its own decay look like an overlap.  Keep BPM help
+            # only for near-grid attacks; the normal local refinement and
+            # comparator alignment handle the remaining timing variation.
+            if abs(grid_time - time) <= min(max(0.025, grid_step * 0.25), BPM_SNAP_TOLERANCE_MS / 1000.0):
+                snapped_positions.append(min(len(signal) - 1, max(0, round(max(0.0, grid_time) * sample_rate))))
             else:
-                snapped.append(time)
-        times = snapped
-        positions = [min(len(signal) - 1, max(0, round(time * sample_rate))) for time in times]
+                snapped_positions.append(position)
+        positions = snapped_positions
     return [Onset(index, sample, sample / sample_rate) for index, sample in enumerate(positions)]

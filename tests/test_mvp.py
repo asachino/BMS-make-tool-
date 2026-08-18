@@ -1,6 +1,7 @@
 import math
 import json
 import io
+import random
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -10,11 +11,13 @@ from bms_reuse.classification.classifier import classify_report
 from bms_reuse.application import AnalysisCancelled, analyze_file
 from bms_reuse.audio.loader import load_audio, mono_signal
 from bms_reuse.cli import main as cli_main
+from bms_reuse.clustering.reuse_plan import build_reuse_plan
 from bms_reuse.detection.onset import Onset, detect_onsets
 from bms_reuse.extraction.hit_extractor import Hit, extract_hits
 from bms_reuse.export.json_exporter import write_json
 from bms_reuse.export.wav_exporter import write_wav
 from bms_reuse.similarity.score import compare_hits
+from bms_reuse.similarity.score import SimilarityReport
 
 
 class MvpSimilarityTest(unittest.TestCase):
@@ -25,6 +28,49 @@ class MvpSimilarityTest(unittest.TestCase):
         report = classify_report(compare_hits(reference, candidate, 48000))
         self.assertEqual(report.classification, "GAIN_VARIANT")
         self.assertAlmostEqual(report.gain_db, -6.0206, places=3)
+
+    def test_similarity_profile_accepts_noise_shift_gain_and_overlap_warning(self):
+        signal = [math.exp(-i / 35.0) * math.sin(i / 3.0) for i in range(400)]
+        overlap_report = SimilarityReport(0, 1, 0.2, 0.99, 0.0, 0.99, 0.99, 0.99, 0.99, 0, True)
+        classified = classify_report(overlap_report)
+        self.assertEqual(classified.classification, "SAME")
+        self.assertTrue(classified.overlap_warning)
+
+        weak_report = SimilarityReport(0, 1, 0.2, 0.70, 0.0, 0.99, 0.70, 0.70, 0.70, 0, True)
+        self.assertEqual(classify_report(weak_report).classification, "OVERLAP")
+
+        reference = Hit(0, 0, 0.0, signal, 0, len(signal))
+        shifted = [0.0] * 20 + signal[:-20]
+        shifted_report = classify_report(compare_hits(reference, Hit(1, 20, 0.01, shifted, 0, len(signal)), 2000))
+        self.assertEqual(shifted_report.classification, "SAME")
+
+        for seed, db in enumerate((-60, -63)):
+            noise = random.Random(seed).gauss
+            noisy = [sample + noise(0.0, 10 ** (db / 20.0)) for sample in signal]
+            noisy_report = classify_report(compare_hits(reference, Hit(2, 0, 0.0, noisy, 0, len(signal)), 2000))
+            self.assertIn(noisy_report.classification, {"SAME", "GAIN_VARIANT"})
+
+    def test_same_kick_noise_is_one_cluster_in_normal_and_fast_modes(self):
+        signal = [math.exp(-i / 35.0) * math.sin(i / 3.0) for i in range(400)]
+        hits = []
+        for index in range(8):
+            rng = random.Random(index)
+            samples = [sample + rng.gauss(0.0, 10 ** (-60 / 20.0)) for sample in signal]
+            hits.append(Hit(index, 0, 0.0, samples, 0, len(samples)))
+
+        def compare(reference, candidate):
+            return compare_hits(reference, candidate, 2000)
+
+        for fast_compare in (False, True):
+            plan, reports = build_reuse_plan(hits, compare, fast_compare=fast_compare)
+            self.assertEqual(len(plan.clusters), 1)
+            self.assertTrue(all(report.classification in {"SAME", "GAIN_VARIANT"} for report in reports))
+
+    def test_similarity_profile_rejects_same_spectrum_different_waveform(self):
+        signal = [math.exp(-i / 35.0) * math.sin(i / 3.0) for i in range(400)]
+        reversed_hit = Hit(1, 0, 0.0, list(reversed(signal)), 0, len(signal))
+        report = classify_report(compare_hits(Hit(0, 0, 0.0, signal, 0, len(signal)), reversed_hit, 2000))
+        self.assertIn(report.classification, {"DIFFERENT", "UNSURE"})
 
 
 class BoundaryTest(unittest.TestCase):
@@ -94,6 +140,13 @@ class BoundaryTest(unittest.TestCase):
         onsets = detect_onsets(signal, 48000, min_separation_ms=50.0)
         self.assertEqual([onset.sample for onset in onsets], [1000, 12000])
 
+    def test_bpm_grid_does_not_move_attacks_beyond_local_tolerance(self):
+        signal = [0.0] * 16000
+        for position in (2, 2802, 5602):
+            signal[position] = 1.0
+        onsets = detect_onsets(signal, 8000, min_separation_ms=200.0, bpm=120.0, subdivision=16)
+        self.assertEqual([onset.sample for onset in onsets], [2802, 5602])
+
     def test_short_overlap_is_flagged(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "overlap.wav"
@@ -104,7 +157,9 @@ class BoundaryTest(unittest.TestCase):
             hits = extract_hits(audio, [Onset(0, 20, 0.02), Onset(1, 30, 0.03)], pre_roll_ms=0, window_ms=100)
             report = compare_hits(hits[0], hits[1], 1000, max_alignment_ms=5)
             self.assertTrue(report.overlap_warning)
-            self.assertEqual(classify_report(report).classification, "OVERLAP")
+            classified = classify_report(report)
+            self.assertEqual(classified.classification, "SAME")
+            self.assertTrue(classified.overlap_warning)
 
     def test_hit_extraction_reports_progress_and_honors_cancel(self):
         with tempfile.TemporaryDirectory() as directory:
