@@ -9,7 +9,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from .classification.classifier import (
     DEFAULT_GAIN_TOLERANCE_DB,
@@ -21,7 +21,7 @@ from .clustering.recluster import recluster_plan
 from .clustering.reuse_plan import Cluster, ReusePlan, build_reuse_plan
 from .detection.onset import BPM_SNAP_TOLERANCE_MS, detect_onsets
 from .detection.loop_rules import build_cut_onsets, normalize_loop_rule, pattern_points
-from .extraction.hit_extractor import Hit, extract_hits
+from .extraction.hit_extractor import Hit, extract_hits, resolve_smart_end_settings
 from .features.automation import detect_automation
 from .features.feature_extractor import extract_features
 from .features.percussion import INSTRUMENT_BANDS, instruments_compatible, normalize_instrument
@@ -30,7 +30,7 @@ from .similarity.score import SimilarityReport, compare_hits
 from .audio.loader import load_audio, mono_signal
 
 
-ANALYSIS_VERSION = "0.4.0"
+ANALYSIS_VERSION = "0.5.0"
 
 
 def relative_sample_prefix_for_export(
@@ -82,6 +82,18 @@ class AnalysisResult:
             if int(hit.id) in active_set
             for variation in (hit.automation or {}).get("variations", [])
         )
+        endpoint_reasons = Counter(
+            str(getattr(hit, "end_reason", "window"))
+            for hit in self.hits
+            if int(hit.id) in active_set
+        )
+        endpoint_warnings = Counter(
+            str(warning)
+            for hit in self.hits
+            if int(hit.id) in active_set
+            for warning in (getattr(hit, "end_warnings", []) or [])
+        )
+        active_hits = [hit for hit in self.hits if int(hit.id) in active_set]
         return {
             "duration_seconds": round(self.duration, 6),
             "detected_hits": detected_hits,
@@ -105,6 +117,13 @@ class AnalysisResult:
             "variations": dict(sorted(variation_counts.items())),
             "loop_rule": self.settings.get("loop_rule", "off"),
             "loop_boundaries": list(self.settings.get("loop_boundaries_sec", [])),
+            "smart_end": bool(self.settings.get("smart_end", False)),
+            "endpoint_reasons": dict(sorted(endpoint_reasons.items())),
+            "endpoint_warnings": dict(sorted(endpoint_warnings.items())),
+            "endpoint_confidence": round(
+                sum(float(getattr(hit, "end_confidence", 0.0)) for hit in active_hits) / max(1, len(active_hits)),
+                3,
+            ),
         }
 
     def to_dict(self) -> dict:
@@ -138,6 +157,19 @@ class AnalysisResult:
                 },
             ),
         }
+        export_data = dict(settings.get("exports") or {}) if isinstance(settings.get("exports"), dict) else {}
+        if export_data:
+            export_data.setdefault(
+                "smart_end",
+                {
+                    "enabled": bool(settings.get("smart_end", False)),
+                    "settings": dict(settings.get("smart_end_settings", {})),
+                },
+            )
+            export_data.setdefault(
+                "endpoint_fields",
+                ["source_start", "source_end", "end_reason", "end_confidence", "end_warnings", "warnings", "effective_settings"],
+            )
         data.update({
             "schema_version": 2,
             "source_hash": self.source_hash,
@@ -153,6 +185,11 @@ class AnalysisResult:
                 "recluster": recluster,
                 "instrument": settings.get("instrument", "kick"),
                 "instrument_profile": settings.get("instrument_profile", {}),
+                "smart_end": {
+                    "enabled": bool(settings.get("smart_end", False)),
+                    "apply_to_explicit": bool(settings.get("smart_end_apply_to_explicit", False)),
+                    "settings": dict(settings.get("smart_end_settings", {})),
+                },
                 "loop": {
                     "rule": settings.get("loop_rule", "off"),
                     "boundaries_sec": list(settings.get("loop_boundaries_sec", [])),
@@ -172,7 +209,7 @@ class AnalysisResult:
                 "active_hit_ids": settings.get("active_hit_ids", [int(hit.id) for hit in self.hits]),
             },
             "validation": settings.get("validation", {}),
-            "exports": settings.get("exports", {}),
+            "exports": export_data,
             "summary": self.summary,
         })
         return data
@@ -334,6 +371,14 @@ def analysis_result_from_dict(data: dict) -> AnalysisResult:
             settings["instrument"] = metadata["instrument"]
         if "instrument_profile" in metadata and "instrument_profile" not in settings:
             settings["instrument_profile"] = metadata["instrument_profile"]
+        smart_end = metadata.get("smart_end") or {}
+        if isinstance(smart_end, dict):
+            if "enabled" in smart_end and "smart_end" not in settings:
+                settings["smart_end"] = bool(smart_end["enabled"])
+            if "apply_to_explicit" in smart_end and "smart_end_apply_to_explicit" not in settings:
+                settings["smart_end_apply_to_explicit"] = bool(smart_end["apply_to_explicit"])
+            if isinstance(smart_end.get("settings"), dict) and "smart_end_settings" not in settings:
+                settings["smart_end_settings"] = dict(smart_end["settings"])
         loop = metadata.get("loop") or {}
         if isinstance(loop, dict):
             if "rule" in loop and "loop_rule" not in settings:
@@ -342,17 +387,64 @@ def analysis_result_from_dict(data: dict) -> AnalysisResult:
                 settings["loop_boundaries_sec"] = loop["boundaries_sec"]
         if "cut_plan" in metadata and "cut_plan" not in settings:
             settings["cut_plan"] = metadata["cut_plan"]
+    def restored_sample_count(raw_hit: dict, effective: dict, samples) -> int | None:
+        """Recover the comparison-window length without loading source audio."""
+        try:
+            serialized = int(raw_hit.get("sample_count"))
+        except (TypeError, ValueError):
+            serialized = 0
+        if serialized > 0:
+            return serialized
+        try:
+            sample_length = len(samples)
+        except TypeError:
+            sample_length = 0
+        if sample_length > 0:
+            return None
+        source_start = _safe_int(raw_hit.get("source_start", 0)) or 0
+        source_end = _safe_int(raw_hit.get("source_end", 0)) or 0
+        source_span = max(0, source_end - source_start)
+        smart_requested = bool(effective.get(
+            "smart_end_requested",
+            effective.get(
+                "smart_end_applied",
+                settings.get("smart_end", False),
+            ),
+        ))
+        # Fixed-window extraction pads the comparison sample to window_ms,
+        # even when source_end stops at the next onset.  Prefer this setting
+        # when available; old JSON falls back to its persisted source range.
+        if not smart_requested:
+            window_ms = effective.get("window_ms", settings.get("window_ms"))
+            try:
+                rate = int(data.get("sample_rate", 0))
+                window_frames = round(rate * float(window_ms) / 1000.0)
+            except (TypeError, ValueError):
+                window_frames = 0
+            if window_frames > 0:
+                return int(window_frames)
+        return source_span or None
+
     hits = []
     for raw in data.get("hits", []):
         raw = dict(raw)
         automation = dict(raw.get("automation") or {})
         if "variations" in raw and "variations" not in automation:
             automation["variations"] = list(raw.get("variations") or [])
+        raw_warnings = raw.get("end_warnings")
+        if raw_warnings is None:
+            raw_warnings = raw.get("warnings", [])
+        raw_warnings = raw_warnings or []
+        if isinstance(raw_warnings, str):
+            raw_warnings = [raw_warnings]
+        effective_settings = dict(raw.get("effective_settings") or {})
+        raw_samples = raw.get("samples", [])
+        sample_count = restored_sample_count(raw, effective_settings, raw_samples)
         hits.append(Hit(
             int(raw.get("id", len(hits))),
             int(raw.get("sample", raw.get("onset_sample", 0))),
             float(raw.get("time", 0.0)),
-            raw.get("samples", []),
+            raw_samples,
             int(raw.get("source_start", 0)),
             int(raw.get("source_end", 0)),
             bool(raw.get("overlap_warning", False)),
@@ -361,6 +453,11 @@ def analysis_result_from_dict(data: dict) -> AnalysisResult:
             automation,
             raw.get("segment_index"),
             str(raw.get("segment_rule", settings.get("loop_rule", "off"))),
+            str(raw.get("end_reason", "window")),
+            float(raw.get("end_confidence", 0.0)),
+            [str(value) for value in raw_warnings],
+            effective_settings,
+            sample_count,
         ))
     if "active_hit_ids" not in settings:
         excluded_ids = {int(value) for value in (settings.get("excluded_hits", []) or [])}
@@ -762,6 +859,9 @@ def analyze_file(
     automation_chop_floor: float = 0.08,
     cut_plan: str | dict | None = None,
     loop_pattern: list[float] | tuple[float, ...] | None = None,
+    smart_end: bool | Mapping[str, object] = True,
+    smart_end_settings: dict | None = None,
+    smart_end_apply_to_explicit: bool = False,
 ) -> AnalysisResult:
     analysis_started = time.perf_counter()
 
@@ -773,6 +873,17 @@ def analyze_file(
 
     path = Path(path)
     instrument = normalize_instrument(instrument)
+    if isinstance(smart_end, Mapping):
+        merged_smart_settings = dict(smart_end)
+        if isinstance(smart_end_settings, Mapping):
+            merged_smart_settings.update(smart_end_settings)
+        smart_end = bool(merged_smart_settings.pop("enabled", True))
+        smart_end_settings = merged_smart_settings
+    resolved_smart_end = resolve_smart_end_settings(instrument, smart_end_settings)
+    resolved_smart_end["enabled"] = bool(smart_end)
+    resolved_smart_end["apply_to_explicit"] = bool(
+        smart_end_apply_to_explicit or resolved_smart_end.get("apply_to_explicit", False)
+    )
     if str(loop_rule).strip().casefold() == "grid" and loop_beats is None:
         loop_beats = 1.0 / max(1, int(subdivision))
     loop_rule = normalize_loop_rule(loop_rule)
@@ -891,6 +1002,11 @@ def analyze_file(
         onsets,
         pre_roll_ms=pre_roll_ms,
         window_ms=window_ms,
+        smart_end=bool(smart_end),
+        smart_end_settings=resolved_smart_end,
+        instrument=instrument,
+        cut_plan_mode=cut_plan_mode,
+        smart_end_apply_to_explicit=smart_end_apply_to_explicit,
         progress=lambda done, total: report(28 + round(done / max(1, total) * 2), f"Extracting hits {done}/{total}"),
         is_cancelled=is_cancelled,
     )
@@ -1012,6 +1128,9 @@ def analyze_file(
         "subdivision": subdivision,
         "fade_in_ms": fade_in_ms,
         "fade_out_ms": fade_out_ms,
+        "smart_end": bool(smart_end),
+        "smart_end_apply_to_explicit": bool(resolved_smart_end["apply_to_explicit"]),
+        "smart_end_settings": resolved_smart_end,
         "bms_channel": bms_channel,
         "instrument_profile": {
             "name": instrument,
@@ -1020,6 +1139,7 @@ def analyze_file(
                 "mid": float(INSTRUMENT_BANDS[instrument][1]),
                 "high": float(INSTRUMENT_BANDS[instrument][2]),
             },
+            "smart_end": dict(resolved_smart_end),
         },
         "instrument_profile_name": instrument,
         "loop_rule": loop_rule,

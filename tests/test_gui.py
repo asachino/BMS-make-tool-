@@ -378,6 +378,167 @@ class GuiSupportTest(unittest.TestCase):
             )
             window.close()
 
+    def test_smart_end_controls_restore_from_preset_and_json(self):
+        from bms_reuse.gui import MainWindow
+        from bms_reuse.project.presets import save_preset
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            preset_path = directory / "smart-end.preset.json"
+            save_preset(
+                preset_path,
+                {
+                    "instrument": "snare",
+                    "smart_end": False,
+                    "smart_end_apply_to_explicit": True,
+                    "smart_end_settings": {
+                        "silence_rms_db": -50.0,
+                        "min_tail_ms": 35.0,
+                        "max_tail_ms": 900.0,
+                        "next_attack_margin_ms": 3.0,
+                        "silence_ms": 77.0,
+                        "safety_margin_ms": 9.0,
+                        "zero_crossing_ms": 4.0,
+                        "silence_peak_db": -28.0,
+                    },
+                    "smart_end_advanced": True,
+                },
+            )
+            window = MainWindow()
+            with patch("bms_reuse.gui.QFileDialog.getOpenFileName", return_value=(str(preset_path), "JSON")):
+                window._load_preset()
+            self.assertEqual(window.terminal_mode_combo.currentData(), "fixed")
+            self.assertEqual(window.instrument_combo.currentData(), "snare")
+            self.assertEqual(window.smart_end_silence_spin.value(), -50.0)
+            self.assertEqual(window.smart_end_min_spin.value(), 35.0)
+            self.assertEqual(window.smart_end_max_spin.value(), 900.0)
+            self.assertEqual(window.smart_end_next_attack_spin.value(), 3.0)
+            self.assertEqual(window.smart_end_silence_ms_spin.value(), 77.0)
+            self.assertEqual(window.smart_end_safety_margin_spin.value(), 9.0)
+            self.assertEqual(window.smart_end_zero_crossing_spin.value(), 4.0)
+            self.assertEqual(window.smart_end_silence_peak_spin.value(), -28.0)
+            self.assertTrue(window.smart_end_apply_explicit_check.isChecked())
+            self.assertTrue(window.smart_end_advanced_check.isChecked())
+            self.assertFalse(window.smart_end_box.isVisible())
+            window.close()
+
+            source = directory / "smart-end.wav"
+            signal = [0.0] * 600
+            for offset in range(120):
+                signal[100 + offset] = 0.8 * (1.0 - offset / 140.0)
+            write_wav(source, signal, 1000)
+            result = analyze_file(
+                source,
+                instrument="snare",
+                onset_threshold=0.1,
+                min_separation_ms=30.0,
+                bpm=120.0,
+                smart_end=True,
+                smart_end_settings={
+                    "silence_rms_db": -48.0,
+                    "min_tail_ms": 32.0,
+                    "max_tail_ms": 850.0,
+                    "next_attack_margin_ms": 4.0,
+                    "silence_ms": 77.0,
+                    "safety_margin_ms": 9.0,
+                    "zero_crossing_ms": 4.0,
+                    "silence_peak_db": -28.0,
+                },
+            )
+            result.settings["smart_end_advanced"] = True
+            json_path = directory / "smart-end.bra.json"
+            json_path.write_text(json.dumps(result.to_dict(), ensure_ascii=False), encoding="utf-8")
+            window = MainWindow()
+            with patch("bms_reuse.gui.QFileDialog.getOpenFileName", return_value=(str(json_path), "JSON")):
+                window._open_analysis_json()
+            self.assertEqual(window.terminal_mode_combo.currentData(), "smart")
+            self.assertEqual(window.instrument_combo.currentData(), "snare")
+            self.assertEqual(window.smart_end_silence_spin.value(), -48.0)
+            self.assertEqual(window.smart_end_min_spin.value(), 32.0)
+            self.assertEqual(window.smart_end_max_spin.value(), 850.0)
+            self.assertEqual(window.smart_end_next_attack_spin.value(), 4.0)
+            self.assertEqual(window.smart_end_silence_ms_spin.value(), 77.0)
+            self.assertEqual(window.smart_end_safety_margin_spin.value(), 9.0)
+            self.assertEqual(window.smart_end_zero_crossing_spin.value(), 4.0)
+            self.assertEqual(window.smart_end_silence_peak_spin.value(), -28.0)
+            self.assertTrue(window.smart_end_advanced_check.isChecked())
+            restored = window._settings()["smart_end_settings"]
+            self.assertEqual(restored["silence_ms"], 77.0)
+            self.assertEqual(restored["safety_margin_ms"], 9.0)
+            self.assertEqual(restored["zero_crossing_ms"], 4.0)
+            self.assertEqual(restored["silence_peak_db"], -28.0)
+            window.close()
+
+    def test_endpoint_detail_and_manual_fix_use_existing_preview_path(self):
+        from bms_reuse.gui import MainWindow
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source = write_wav(directory / "endpoint.wav", [[0.2]] * 100, 1000)
+            audio = load_audio(source)
+            hit = Hit(
+                1, 0, 0.0, audio.samples, 0, 40,
+                end_reason="silence", end_confidence=0.86,
+                end_warnings=["TAIL_CUT"],
+                effective_settings={"hard_end_sample": 80, "smart_end_requested": True, "smart_end_applied": True},
+            )
+            plan = ReusePlan(
+                [Cluster(1, 1, [1])],
+                [{"hit": 1, "time": 0.0, "sample_id": "sample_001", "gain_db": 0.0}],
+            )
+            samples_dir = directory / "samples"
+            sample_paths = write_hit_wavs(samples_dir, audio, [hit], plan)
+            exports = {
+                "samples_dir": str(samples_dir),
+                "samples": [str(path) for path in sample_paths],
+            }
+            result = AnalysisResult(
+                str(source), 1000, 0.1, [hit], [], plan,
+                {
+                    "instrument": "kick",
+                    "smart_end": True,
+                    "smart_end_settings": {"silence_rms_db": -42.0, "min_tail_ms": 18.0, "max_tail_ms": 620.0},
+                    "active_hit_ids": [1],
+                    "review_overrides": {},
+                    "review_targets": {},
+                    "excluded_hits": [],
+                    "exports": exports,
+                    "bpm": 120.0,
+                    "offset": 0.0,
+                    "subdivision": 16,
+                    "bms_channel": "01",
+                },
+                "endpoint-hash",
+            )
+            window = MainWindow()
+            window._on_result(result, dict(exports))
+            window._select_hit(1)
+            self.assertIn("終端", window.detail_metrics.text())
+            self.assertIn("切りすぎ注意", window.detail_metrics.text())
+            self.assertTrue(window.fixed_length_preview_button.isEnabled())
+            self.assertTrue(window.smart_end_preview_button.isEnabled())
+            with patch.object(window.waveform, "play_range") as play_range:
+                window._preview_endpoint_variant("fixed")
+                play_range.assert_called_once_with(0.0, 0.08)
+                play_range.reset_mock()
+                window._preview_endpoint_variant("smart")
+                play_range.assert_called_once_with(0.0, 0.04)
+            window.terminal_duration_spin.setValue(20.0)
+            window._apply_terminal_fix()
+            self.assertEqual(hit.source_end, 20)
+            self.assertEqual(hit.end_reason, "manual")
+            self.assertEqual(result.settings["terminal_overrides"]["1"]["source_end"], 20)
+            self.assertIn("手動境界", window.detail_metrics.text())
+            self.assertAlmostEqual(window.rows[0]["end"], 0.02)
+            self.assertEqual(load_audio(Path(window.exported["samples"][0])).frame_count, 20, result.settings.get("validation"))
+            self.assertTrue(result.settings["validation"].get("ok"))
+            self.assertTrue(window.fixed_length_preview_button.isEnabled())
+            self.assertFalse(window.smart_end_preview_button.isEnabled())
+            with patch.object(window.waveform, "play_range") as play_range:
+                window._preview_selected_cut()
+            play_range.assert_called_once_with(0.0, 0.02)
+            window.close()
+
     def test_review_rebuild_syncs_plan_outputs_and_bmson_prefix(self):
         from bms_reuse.gui import MainWindow
         from bms_reuse.similarity.score import SimilarityReport

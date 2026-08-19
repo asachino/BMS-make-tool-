@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import re
+import wave
 
 
 def _referenced_files(path: Path) -> list[Path]:
@@ -47,6 +48,11 @@ def _bms_event_count(path: Path) -> int:
     return count
 
 
+def _wav_frame_count(path: Path) -> int:
+    with wave.open(str(path), "rb") as stream:
+        return int(stream.getnframes())
+
+
 def check_export_quality(result, exported: dict | None = None) -> dict:
     exported = exported or {}
     sample_paths = exported.get("samples", []) if isinstance(exported, dict) else []
@@ -61,11 +67,58 @@ def check_export_quality(result, exported: dict | None = None) -> dict:
     sample_requested = sample_dir is not None or bool(sample_paths)
     sample_files = {Path(path).resolve() for path in sample_paths}
     actual_files = {path.resolve() for path in sample_dir.glob("*.wav")} if sample_dir and sample_dir.is_dir() else set()
+    endpoint_mismatches: list[dict] = []
+    if sample_requested:
+        paths_by_name = {path.name.casefold(): path for path in sample_files}
+        for cluster in result.plan.clusters:
+            sample_path = paths_by_name.get(f"sample_{int(cluster.id):03d}.wav".casefold())
+            if sample_path is None or not sample_path.is_file():
+                continue
+            representative = next(
+                (hit for hit in result.hits if int(hit.id) == int(cluster.representative_hit)),
+                None,
+            )
+            if representative is None:
+                continue
+            effective = getattr(representative, "effective_settings", {}) or {}
+            smart_requested = bool(effective.get(
+                "smart_end_requested",
+                effective.get(
+                    "smart_end_applied",
+                    effective.get("enabled", False),
+                ),
+            ))
+            expected_frames = (
+                max(0, int(representative.source_end) - int(representative.source_start))
+                if smart_requested
+                else int(representative.sample_count)
+            )
+            try:
+                actual_frames = _wav_frame_count(sample_path)
+            except (OSError, wave.Error):
+                endpoint_mismatches.append({
+                    "sample": str(sample_path),
+                    "cluster": int(cluster.id),
+                    "expected_frames": expected_frames,
+                    "actual_frames": None,
+                    "smart_end": smart_requested,
+                    "error": "WAVフレーム数を読み取れませんでした",
+                })
+                continue
+            if actual_frames != expected_frames:
+                endpoint_mismatches.append({
+                    "sample": str(sample_path),
+                    "cluster": int(cluster.id),
+                    "expected_frames": expected_frames,
+                    "actual_frames": actual_frames,
+                    "smart_end": smart_requested,
+                })
     checks = {
         "sample_folder_exists": sample_dir.is_dir() if sample_dir is not None else True,
         "sample_count_matches_clusters": len(sample_paths) == expected if sample_requested else True,
         "sample_files_exist": all(path.is_file() for path in sample_files) if sample_requested else True,
         "sample_folder_has_no_extra_wav": actual_files == sample_files if sample_dir else True,
+        "sample_frames_match_endpoint": not endpoint_mismatches if sample_requested else True,
         "event_count_matches_hits": len(result.plan.events) == active_hit_count,
         "cluster_ids_unique": len({cluster.id for cluster in result.plan.clusters}) == expected,
         "source_hash_present": bool(result.source_hash),
@@ -98,6 +151,7 @@ def check_export_quality(result, exported: dict | None = None) -> dict:
         "active_hits": active_hit_count,
         "missing_samples": sorted(str(path) for path in sample_files if not path.is_file()),
         "extra_samples": sorted(str(path) for path in actual_files - sample_files),
+        "endpoint_mismatches": endpoint_mismatches,
     }
 
 

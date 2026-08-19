@@ -92,3 +92,15 @@ dist\bms-reuse.exe analyze roll.wav --cut-plan pattern --loop-pattern 0.125,0.12
 ```
 
 各ヒットには音量・音色・密度（切り刻み）・テール・ステレオ・グリッド外（`OFF_GRID`）変化の`automation.variations`が保存されます。これはレビュー用の警告で、類似クラスタを自動的に拒否するものではありません。旧APIの`loop_rule`／`loop_seconds`等も引き続き利用できます。
+
+### スマート終端
+
+通常の解析では、楽器別の最小／最大テール、RMS・ピークの減衰、連続無音、次アタック上限、ゼロクロス近傍、安全マージンを組み合わせて代表WAVの終端を自動調整します。`kick`は短め、`snare`は余韻長め、`hihat`は音が残る開閉の違いを波形の減衰から判定します。`--no-smart-end`で従来の固定境界に戻せます。
+
+```powershell
+dist\bms-reuse.exe analyze stem.wav --smart-end `
+  --smart-end-min-tail-ms 18 --smart-end-silence-ms 30 `
+  --smart-end-safety-margin-ms 1
+```
+
+`grid`／`manual`／`pattern`の明示境界は既定で保持され、必要な場合だけ`--smart-end-apply-explicit`で短縮を許可します。各ヒットの`source_end`、`end_reason`、`end_confidence`、`end_warnings`、`effective_settings`はschema v2 JSONとCSVに保存されます。smart終端時の代表WAVは実際の切り出し範囲だけ、`--no-smart-end`の固定モードでは従来どおり`window_ms`長で書き出します。

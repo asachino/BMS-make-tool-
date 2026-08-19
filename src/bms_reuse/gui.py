@@ -71,6 +71,7 @@ from .export.wav_exporter import write_hit_wavs
 from .export.bms_exporter import write_bms
 from .export.bmson_exporter import write_bmson
 from .export.quality import validate_exports
+from .extraction.hit_extractor import resolve_smart_end_settings
 from .project.presets import load_preset, save_preset
 
 
@@ -126,6 +127,39 @@ CUT_MODE_LABELS = {
 
 CUT_MODE_ALIASES = {"transient": "auto", "hybrid": "pattern"}
 
+TERMINAL_MODE_LABELS = {
+    "smart": "スマート終端",
+    "fixed": "固定境界",
+}
+
+END_REASON_LABELS = {
+    "silence": "無音検出",
+    "max_duration": "最長到達",
+    "next_attack": "次アタック前",
+    "window": "固定窓",
+    "no_decay": "減衰なし",
+    "grid": "グリッド境界",
+    "manual": "手動境界",
+    "pattern": "パターン境界",
+    "fixed": "固定境界",
+}
+
+END_WARNING_LABELS = {
+    "TAIL_CUT": "切りすぎ注意",
+    "TOO_LONG": "長すぎ注意",
+    "NEXT_ATTACK_LIMIT": "次アタック保護",
+    "minimum_tail_clipped": "最短値を確保できず",
+    "max_tail_limit": "最長値で制限",
+    "zero_crossing_not_found": "ゼロクロス未検出",
+    "zero_crossing_adjusted": "ゼロクロス補正",
+    "hard_limit_before_attack": "アタック前に上限",
+    "no_continuous_silence": "連続無音なし",
+    "no_decay": "減衰なし",
+    "max_duration": "最長到達",
+    "empty_tail": "終端データなし",
+    "no_attack_energy": "アタックなし",
+}
+
 TIME_SIGNATURE_LABELS = {
     "4/4": "4/4",
     "3/4": "3/4",
@@ -139,6 +173,8 @@ GUI_ONLY_SETTING_KEYS = {
     "user_boundaries",
     "hit_type_overrides",
     "cut_overrides",
+    "terminal_overrides",
+    "smart_end_advanced",
 }
 
 
@@ -333,6 +369,14 @@ def _event_flags(result: AnalysisResult, index: int, hit, report) -> str:
     return "・".join(dict.fromkeys(flags))
 
 
+def _endpoint_info(hit) -> tuple[str, float, list[str]]:
+    reason = str(getattr(hit, "end_reason", "window") or "window")
+    confidence = float(getattr(hit, "end_confidence", 0.0) or 0.0)
+    raw_warnings = getattr(hit, "end_warnings", []) or []
+    warnings = [END_WARNING_LABELS.get(str(value), str(value)) for value in raw_warnings]
+    return END_REASON_LABELS.get(reason, reason), confidence, list(dict.fromkeys(warnings))
+
+
 def classify_hits(result: AnalysisResult) -> list[dict]:
     """Flatten the core result into rows suitable for a review table."""
     report_by_hit = {report.candidate_id: report for report in result.comparisons}
@@ -365,6 +409,10 @@ def classify_hits(result: AnalysisResult) -> list[dict]:
         cut_overrides = result.settings.get("cut_overrides", {}) if isinstance(result.settings, dict) else {}
         cut_state = cut_overrides.get(str(hit.id), "") if isinstance(cut_overrides, dict) else ""
         cut_state = {"accepted": "採用", "excluded": "除外"}.get(str(cut_state), "")
+        end_reason, end_confidence, end_warnings = _endpoint_info(hit)
+        endpoint_status = f"終端:{end_reason}"
+        if end_warnings:
+            endpoint_status += "（" + "、".join(end_warnings) + "）"
         rows.append(
             {
                 "id": hit.id,
@@ -383,6 +431,13 @@ def classify_hits(result: AnalysisResult) -> list[dict]:
                 "cluster_id": cluster_by_hit.get(hit.id),
                 "start": hit.source_start / max(1, result.sample_rate),
                 "end": hit.source_end / max(1, result.sample_rate),
+                "source_end": int(hit.source_end),
+                "end_reason": str(getattr(hit, "end_reason", "window") or "window"),
+                "end_reason_label": end_reason,
+                "end_confidence": end_confidence,
+                "end_warnings": list(getattr(hit, "end_warnings", []) or []),
+                "end_warning_labels": end_warnings,
+                "endpoint_status": endpoint_status,
                 "review_override": override,
                 "sound_type": sound_type,
                 "event_flags": _event_flags(result, index, hit, report),
@@ -857,6 +912,38 @@ class WaveformCanvas(QWidget):
         elif not owner.source_path:
             painter.setPen(QColor("#4f555a"))
             painter.drawText(rect, Qt.AlignCenter, "入力WAVを選択すると波形を表示")
+
+        # Endpoint markers use a separate, restrained line so the onset and
+        # cluster markers remain legible.  The core owns the endpoint; the GUI
+        # only renders its stored reason/confidence/warnings.
+        end_label_gap = max(96, min(160, rect.width() // 7))
+        last_end_label_x = rect.left() - end_label_gap
+        for row in owner.rows:
+            endpoint_time = float(row.get("end", row.get("time", 0.0)))
+            if endpoint_time < start or endpoint_time > end:
+                continue
+            x = rect.left() + round((endpoint_time - start) / max(visible, 1e-9) * rect.width())
+            selected = row["id"] == owner.selected_id
+            warning = bool(row.get("end_warnings"))
+            color = QColor("#b45309" if warning else "#596168")
+            painter.setPen(QPen(color, 2 if selected else 1, Qt.DotLine))
+            painter.drawLine(x, rect.top(), x, rect.bottom())
+            if owner.marker_labels_check.isChecked() and (selected or x - last_end_label_x >= end_label_gap):
+                confidence = float(row.get("end_confidence", 0.0) or 0.0) * 100.0
+                label = f"終端 {row.get('end_reason_label', '固定境界')} {confidence:.0f}%"
+                if warning:
+                    label += "・警告"
+                label_width = painter.fontMetrics().horizontalAdvance(label) + 8
+                label_rect = QRect(x + 2, rect.bottom() - 20, label_width, 17)
+                if label_rect.right() > rect.right():
+                    label_rect.moveRight(rect.right())
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor("#b7b9bb"))
+                painter.drawRect(label_rect)
+                painter.setPen(color)
+                painter.drawText(label_rect.left() + 4, label_rect.bottom() - 4, label)
+                painter.setBrush(Qt.NoBrush)
+                last_end_label_x = x
 
         nearest_id = None
         if owner.rows and owner.position >= 0:
@@ -1465,6 +1552,56 @@ class MainWindow(QMainWindow):
         self.onset_spin = self._double_spin(0.35, 0.0, 1.0, 0.01, 2)
         self.pre_roll_spin = self._double_spin(5.0, 0.0, 1000.0, 1.0, 0, " ms")
         self.window_spin = self._double_spin(800.0, 10.0, 10000.0, 10.0, 0, " ms")
+        self.terminal_mode_combo = QComboBox()
+        self.terminal_mode_combo.addItem(TERMINAL_MODE_LABELS["smart"], "smart")
+        self.terminal_mode_combo.addItem(TERMINAL_MODE_LABELS["fixed"], "fixed")
+        self.terminal_mode_combo.setAccessibleName("終端モード")
+        self.terminal_mode_combo.setToolTip("固定境界またはコアのスマート終端を選択")
+        smart_defaults = resolve_smart_end_settings("kick")
+        self.smart_end_silence_spin = self._double_spin(
+            smart_defaults["silence_rms_db"], -80.0, 0.0, 1.0, 0, " dB"
+        )
+        self.smart_end_silence_spin.setAccessibleName("減衰しきい値")
+        self.smart_end_silence_spin.setToolTip("RMSがこの値を下回る連続区間を終端候補にします")
+        self.smart_end_min_spin = self._double_spin(
+            smart_defaults["min_tail_ms"], 0.0, 5000.0, 1.0, 0, " ms"
+        )
+        self.smart_end_min_spin.setAccessibleName("最短テール")
+        self.smart_end_max_spin = self._double_spin(
+            smart_defaults["max_tail_ms"], 1.0, 10000.0, 1.0, 0, " ms"
+        )
+        self.smart_end_max_spin.setAccessibleName("最長テール")
+        self.smart_end_next_attack_spin = self._double_spin(
+            smart_defaults["next_attack_margin_ms"], 0.0, 1000.0, 0.5, 1, " ms"
+        )
+        self.smart_end_next_attack_spin.setAccessibleName("次アタック保護")
+        self.smart_end_next_attack_spin.setToolTip("次のアタックより手前に確保する安全幅")
+        self.smart_end_advanced_check = QCheckBox("詳細設定を表示")
+        self.smart_end_advanced_check.setAccessibleName("スマート終端の詳細設定")
+        self.smart_end_advanced_check.setToolTip("無音判定とゼロクロスの詳細値を表示")
+        self.smart_end_silence_ms_spin = self._double_spin(
+            smart_defaults["silence_ms"], 1.0, 2000.0, 1.0, 0, " ms"
+        )
+        self.smart_end_silence_ms_spin.setAccessibleName("連続無音時間")
+        self.smart_end_silence_ms_spin.setToolTip("終端とみなす連続無音の長さ")
+        self.smart_end_safety_margin_spin = self._double_spin(
+            smart_defaults["safety_margin_ms"], 0.0, 1000.0, 0.5, 1, " ms"
+        )
+        self.smart_end_safety_margin_spin.setAccessibleName("安全マージン")
+        self.smart_end_safety_margin_spin.setToolTip("終端候補の後ろに残す安全幅")
+        self.smart_end_zero_crossing_spin = self._double_spin(
+            smart_defaults["zero_crossing_ms"], 0.0, 1000.0, 0.5, 1, " ms"
+        )
+        self.smart_end_zero_crossing_spin.setAccessibleName("ゼロクロス探索幅")
+        self.smart_end_zero_crossing_spin.setToolTip("終端付近で探すゼロクロスの範囲")
+        self.smart_end_silence_peak_spin = self._double_spin(
+            smart_defaults["silence_peak_db"], -80.0, 0.0, 1.0, 0, " dB"
+        )
+        self.smart_end_silence_peak_spin.setAccessibleName("ピーク減衰しきい値")
+        self.smart_end_silence_peak_spin.setToolTip("ピーク値側の無音しきい値")
+        self.smart_end_apply_explicit_check = QCheckBox("明示境界にも適用")
+        self.smart_end_apply_explicit_check.setAccessibleName("明示境界へのスマート終端適用")
+        self.smart_end_apply_explicit_check.setToolTip("grid/manual/patternの境界をスマート終端で短縮できます")
         self.bpm_spin = self._double_spin(0.0, 0.0, 400.0, 0.5, 1, " BPM")
         self.bpm_spin.setSpecialValueText("未入力")
         self.bpm_spin.setToolTip("20〜400の範囲で入力（必須）")
@@ -1506,6 +1643,7 @@ class MainWindow(QMainWindow):
         add_setting_row("オンセットしきい値", self.onset_spin)
         add_setting_row("プリロール", self.pre_roll_spin)
         add_setting_row("ウィンドウ長", self.window_spin)
+        add_setting_row("終端モード", self.terminal_mode_combo)
         add_setting_row("BPM（必須）", self.bpm_spin)
         add_setting_row("最小間隔（拍）", self.beat_division_combo)
         add_setting_row("マージン(%)", self.margin_spin)
@@ -1518,6 +1656,37 @@ class MainWindow(QMainWindow):
         add_setting_row("比較モード", self.fast_compare_check)
         add_setting_row("BMSチャンネル", self.bms_channel_combo)
         left_layout.addWidget(settings_box)
+
+        self.smart_end_box = QGroupBox("スマート終端の詳細")
+        smart_form = QFormLayout(self.smart_end_box)
+        smart_form.setContentsMargins(0, 4, 0, 0)
+        smart_form.setHorizontalSpacing(12)
+        smart_form.setVerticalSpacing(7)
+        smart_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        smart_form.addRow("減衰しきい値", self.smart_end_silence_spin)
+        smart_form.addRow("最短テール", self.smart_end_min_spin)
+        smart_form.addRow("最長テール", self.smart_end_max_spin)
+        smart_form.addRow("次アタック保護", self.smart_end_next_attack_spin)
+        smart_form.addRow("", self.smart_end_advanced_check)
+        self.smart_end_advanced_widget = QWidget()
+        advanced_form = QFormLayout(self.smart_end_advanced_widget)
+        advanced_form.setContentsMargins(0, 0, 0, 0)
+        advanced_form.setHorizontalSpacing(12)
+        advanced_form.setVerticalSpacing(7)
+        advanced_form.addRow("連続無音", self.smart_end_silence_ms_spin)
+        advanced_form.addRow("安全マージン", self.smart_end_safety_margin_spin)
+        advanced_form.addRow("ゼロクロス探索", self.smart_end_zero_crossing_spin)
+        advanced_form.addRow("ピーク減衰", self.smart_end_silence_peak_spin)
+        self.smart_end_advanced_widget.setVisible(False)
+        smart_form.addRow("", self.smart_end_advanced_widget)
+        smart_form.addRow("", self.smart_end_apply_explicit_check)
+        smart_hint = QLabel("固定境界は既定で保持。判定理由・信頼度・警告を波形に表示")
+        smart_hint.setObjectName("Subtle")
+        smart_hint.setWordWrap(True)
+        smart_form.addRow("", smart_hint)
+        left_layout.addWidget(self.smart_end_box)
+        self.terminal_mode_combo.currentIndexChanged.connect(self._on_terminal_mode_changed)
+        self.smart_end_advanced_check.toggled.connect(self.smart_end_advanced_widget.setVisible)
 
         cut_box = QGroupBox("音切り補助")
         cut_form = QFormLayout(cut_box)
@@ -1731,6 +1900,38 @@ class MainWindow(QMainWindow):
         self.detail_metrics.setWordWrap(True)
         detail_box.addWidget(self.detail_title)
         detail_box.addWidget(self.detail_metrics)
+        terminal_row = QHBoxLayout()
+        terminal_row.addWidget(QLabel("終端長"))
+        self.terminal_duration_spin = self._double_spin(0.0, 0.0, 10000.0, 1.0, 1, " ms")
+        self.terminal_duration_spin.setAccessibleName("選択ヒットの終端長")
+        self.terminal_duration_spin.setToolTip("選択ヒットの開始から終端まで。固定すると代表WAVにも反映")
+        self.terminal_duration_spin.setEnabled(False)
+        terminal_row.addWidget(self.terminal_duration_spin)
+        self.terminal_fix_button = QPushButton("終端を固定")
+        self.terminal_fix_button.setAccessibleName("選択ヒットの終端を固定")
+        self.terminal_fix_button.setToolTip("入力した終端長を手動境界として保存し、出力を更新")
+        self.terminal_fix_button.setEnabled(False)
+        self.terminal_fix_button.clicked.connect(self._apply_terminal_fix)
+        terminal_row.addWidget(self.terminal_fix_button)
+        detail_box.addLayout(terminal_row)
+        self.terminal_status_label = QLabel("解析後に終端情報を表示")
+        self.terminal_status_label.setObjectName("Subtle")
+        self.terminal_status_label.setWordWrap(True)
+        detail_box.addWidget(self.terminal_status_label)
+        endpoint_preview_row = QHBoxLayout()
+        self.fixed_length_preview_button = QPushButton("固定長を試聴")
+        self.fixed_length_preview_button.setAccessibleName("選択音の固定長を試聴")
+        self.fixed_length_preview_button.setToolTip("スマート終端を適用しない元の境界を試聴")
+        self.fixed_length_preview_button.setEnabled(False)
+        self.fixed_length_preview_button.clicked.connect(lambda: self._preview_endpoint_variant("fixed"))
+        self.smart_end_preview_button = QPushButton("スマート終端を試聴")
+        self.smart_end_preview_button.setAccessibleName("選択音のスマート終端を試聴")
+        self.smart_end_preview_button.setToolTip("コアが判定したスマート終端までを試聴")
+        self.smart_end_preview_button.setEnabled(False)
+        self.smart_end_preview_button.clicked.connect(lambda: self._preview_endpoint_variant("smart"))
+        endpoint_preview_row.addWidget(self.fixed_length_preview_button)
+        endpoint_preview_row.addWidget(self.smart_end_preview_button)
+        detail_box.addLayout(endpoint_preview_row)
         type_row = QHBoxLayout()
         type_row.addWidget(QLabel("音種"))
         self.hit_type_combo = QComboBox()
@@ -1900,6 +2101,35 @@ class MainWindow(QMainWindow):
         if path:
             self.json_edit.setText(path)
 
+    @staticmethod
+    def _apply_terminal_overrides(result: AnalysisResult) -> None:
+        settings = result.settings if isinstance(result.settings, dict) else {}
+        overrides = settings.get("terminal_overrides", {})
+        if not isinstance(overrides, dict):
+            return
+        for hit in result.hits:
+            raw = overrides.get(str(hit.id), overrides.get(hit.id))
+            if not isinstance(raw, dict) or "source_end" not in raw:
+                continue
+            try:
+                source_start = int(hit.source_start)
+                requested_end = int(raw["source_end"])
+                effective = dict(getattr(hit, "effective_settings", {}) or {})
+                hard_end = int(effective.get("hard_end_sample", hit.source_end))
+                upper = max(source_start + 1, hard_end)
+                hit.source_end = max(source_start + 1, min(requested_end, upper))
+            except (TypeError, ValueError):
+                continue
+            hit.end_reason = "manual"
+            hit.end_confidence = 1.0
+            hit.end_warnings = []
+            effective = dict(getattr(hit, "effective_settings", {}) or {})
+            effective["manual_override"] = True
+            effective["manual_source_end"] = int(hit.source_end)
+            effective["smart_end_requested"] = True
+            effective["smart_end_applied"] = True
+            hit.effective_settings = effective
+
     def _restore_result_settings(self, result: AnalysisResult, data: dict) -> None:
         """Restore analysis controls before a saved project is rendered."""
         settings = result.settings
@@ -1939,6 +2169,7 @@ class MainWindow(QMainWindow):
         instrument_index = self.instrument_combo.findData(settings.get("instrument", "kick"))
         if instrument_index >= 0:
             self.instrument_combo.setCurrentIndex(instrument_index)
+        self._set_smart_end_controls(settings)
         division_index = self.beat_division_combo.findData(settings.get("beat_division"))
         if division_index >= 0:
             self.beat_division_combo.setCurrentIndex(division_index)
@@ -1979,6 +2210,7 @@ class MainWindow(QMainWindow):
                 "user_boundaries": boundaries,
             }
         )
+        self._apply_terminal_overrides(result)
 
     def _open_analysis_json(self) -> None:
         current = self.json_edit.text() or str(Path.home())
@@ -2122,6 +2354,7 @@ class MainWindow(QMainWindow):
                 index = self.instrument_combo.findData(instrument)
                 if index >= 0:
                     self.instrument_combo.setCurrentIndex(index)
+            self._set_smart_end_controls(values)
             self.fast_compare_check.setChecked(bool(values.get("fast_compare", False)))
             if "bms_channel" in values:
                 index = self.bms_channel_combo.findData(values["bms_channel"])
@@ -2152,6 +2385,43 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _same_path(left: str | Path, right: str | Path) -> bool:
         return str(Path(left).resolve()).casefold() == str(Path(right).resolve()).casefold()
+
+    def _on_terminal_mode_changed(self, _value=None) -> None:
+        smart = self.terminal_mode_combo.currentData() == "smart"
+        self.smart_end_box.setVisible(smart)
+        self.smart_end_box.setEnabled(smart)
+
+    def _set_smart_end_controls(self, settings: dict | None) -> None:
+        settings = settings if isinstance(settings, dict) else {}
+        instrument = settings.get("instrument") or self.instrument_combo.currentData() or "kick"
+        raw = settings.get("smart_end_settings", {})
+        raw = raw if isinstance(raw, dict) else {}
+        values = resolve_smart_end_settings(instrument, raw)
+        mode = "smart" if settings.get("smart_end", True) else "fixed"
+        mode_index = self.terminal_mode_combo.findData(mode)
+        if mode_index >= 0:
+            self.terminal_mode_combo.blockSignals(True)
+            self.terminal_mode_combo.setCurrentIndex(mode_index)
+            self.terminal_mode_combo.blockSignals(False)
+        for widget, key in (
+            (self.smart_end_silence_spin, "silence_rms_db"),
+            (self.smart_end_min_spin, "min_tail_ms"),
+            (self.smart_end_max_spin, "max_tail_ms"),
+            (self.smart_end_next_attack_spin, "next_attack_margin_ms"),
+            (self.smart_end_silence_ms_spin, "silence_ms"),
+            (self.smart_end_safety_margin_spin, "safety_margin_ms"),
+            (self.smart_end_zero_crossing_spin, "zero_crossing_ms"),
+            (self.smart_end_silence_peak_spin, "silence_peak_db"),
+        ):
+            try:
+                widget.setValue(float(values[key]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.smart_end_apply_explicit_check.setChecked(
+            bool(settings.get("smart_end_apply_to_explicit", values.get("apply_to_explicit", False)))
+        )
+        self.smart_end_advanced_check.setChecked(bool(settings.get("smart_end_advanced", False)))
+        self._on_terminal_mode_changed()
 
     def _bpm_error_text(self) -> str:
         bpm = self.bpm_spin.value()
@@ -2210,6 +2480,10 @@ class MainWindow(QMainWindow):
         denominator = int(self.beat_division_combo.currentData())
         margin = self.margin_spin.value()
         min_interval_sec = (60.0 / bpm) / denominator * (margin / 100.0)
+        smart_end = self.terminal_mode_combo.currentData() == "smart"
+        smart_end_settings = self._smart_end_settings()
+        smart_end_settings["enabled"] = smart_end
+        smart_end_settings["apply_to_explicit"] = self.smart_end_apply_explicit_check.isChecked()
         return {
             "instrument": self.instrument_combo.currentData() or "kick",
             "threshold": self.threshold_spin.value(),
@@ -2230,6 +2504,10 @@ class MainWindow(QMainWindow):
             "subdivision": self.subdivision_spin.value(),
             "fast_compare": self.fast_compare_check.isChecked(),
             "bms_channel": self.bms_channel_combo.currentData() or "01",
+            "smart_end": smart_end,
+            "smart_end_apply_to_explicit": self.smart_end_apply_explicit_check.isChecked(),
+            "smart_end_settings": smart_end_settings,
+            "smart_end_advanced": self.smart_end_advanced_check.isChecked(),
             "loop_cut_mode": _canonical_cut_mode(self.cut_mode_combo.currentData()),
             "time_signature": self.time_signature_combo.currentData() or "4/4",
             "swing_percent": self.swing_spin.value(),
@@ -2237,7 +2515,25 @@ class MainWindow(QMainWindow):
             "cut_plan": self._cut_plan_settings(),
             "hit_type_overrides": {},
             "cut_overrides": {},
+            "terminal_overrides": {},
         }
+
+    def _smart_end_settings(self) -> dict:
+        """Return the core-resolved endpoint settings shown by the GUI."""
+        return resolve_smart_end_settings(
+            self.instrument_combo.currentData() or "kick",
+            {
+                "silence_rms_db": self.smart_end_silence_spin.value(),
+                "min_tail_ms": self.smart_end_min_spin.value(),
+                "max_tail_ms": self.smart_end_max_spin.value(),
+                "next_attack_margin_ms": self.smart_end_next_attack_spin.value(),
+                "silence_ms": self.smart_end_silence_ms_spin.value(),
+                "safety_margin_ms": self.smart_end_safety_margin_spin.value(),
+                "zero_crossing_ms": self.smart_end_zero_crossing_spin.value(),
+                "silence_peak_db": self.smart_end_silence_peak_spin.value(),
+                "apply_to_explicit": self.smart_end_apply_explicit_check.isChecked(),
+            },
+        )
 
     def _apply_user_boundaries(self) -> None:
         boundaries = _parse_user_boundaries(self.user_boundary_edit.text())
@@ -2440,6 +2736,8 @@ class MainWindow(QMainWindow):
     def _on_result(self, result: AnalysisResult, exported: dict) -> None:
         self.result, self.exported = result, exported
         result.settings.setdefault("active_hit_ids", [int(hit.id) for hit in result.hits])
+        self._set_smart_end_controls(result.settings)
+        self._apply_terminal_overrides(result)
         cut_plan = result.settings.get("cut_plan", {}) if isinstance(result.settings, dict) else {}
         cut_plan = cut_plan if isinstance(cut_plan, dict) else {}
         cut_mode = _canonical_cut_mode(cut_plan.get("mode", result.settings.get("loop_cut_mode", "auto")))
@@ -2594,11 +2892,18 @@ class MainWindow(QMainWindow):
                 continue
             if sound_wanted not in {"All", row.get("sound_type", "other")}:
                 continue
-            haystack = f"{row['id']} {row['time']:.3f} {row['sample_id']} {row.get('sound_type', '')} {row.get('event_flags', '')}".casefold()
+            haystack = f"{row['id']} {row['time']:.3f} {row['sample_id']} {row.get('sound_type', '')} {row.get('event_flags', '')} {row.get('endpoint_status', '')}".casefold()
             if query and query not in haystack:
                 continue
             index = self.hit_table.rowCount()
             self.hit_table.insertRow(index)
+            notices = []
+            if row["overlap"]:
+                notices.append("音の重なり")
+            if row.get("end_warnings"):
+                notices.append("終端: " + "、".join(row.get("end_warning_labels", [])))
+            elif row.get("end_reason") not in {"window", "grid", "manual", "pattern"}:
+                notices.append("終端: " + row.get("end_reason_label", "固定境界"))
             values = [
                 str(row["id"]),
                 format_seconds(row["time"]),
@@ -2606,7 +2911,7 @@ class MainWindow(QMainWindow):
                 f"{row['confidence']:.1f}%",
                 f"{row['gain_db']:+.2f} dB",
                 row["sample_id"],
-                "音の重なり" if row["overlap"] else "",
+                " · ".join(notices),
                 INSTRUMENT_LABELS.get(row.get("sound_type", "other"), "その他"),
                 row.get("cut_state") or row.get("event_flags", ""),
             ]
@@ -2792,6 +3097,21 @@ class MainWindow(QMainWindow):
         self.review_target_combo.setCurrentIndex(max(0, target_index))
         self.review_target_combo.blockSignals(False)
         self._set_selection_actions(True)
+        duration_ms = max(0.0, (float(row["end"]) - float(row["start"])) * 1000.0)
+        self.terminal_duration_spin.blockSignals(True)
+        self.terminal_duration_spin.setValue(duration_ms)
+        self.terminal_duration_spin.blockSignals(False)
+        terminal_overrides = self.result.settings.get("terminal_overrides", {}) if self.result else {}
+        terminal_overrides = terminal_overrides if isinstance(terminal_overrides, dict) else {}
+        terminal_override = terminal_overrides.get(str(hit_id), {})
+        if isinstance(terminal_override, dict) and terminal_override:
+            self.terminal_status_label.setText("終端を手動固定済み · 出力へ反映済み")
+        else:
+            warnings = "、".join(row.get("end_warning_labels", [])) or "なし"
+            self.terminal_status_label.setText(
+                f"{row.get('end_reason_label', '固定境界')} · 信頼度 {float(row.get('end_confidence', 0.0)) * 100.0:.0f}% · 警告 {warnings}"
+            )
+        self._update_endpoint_preview_actions(row)
         label = CLASS_LABELS.get(row["classification"], row["classification"])
         self.detail_title.setText(f"ヒット {row['id']:03d}  ·  {label}")
         self.detail_title.setStyleSheet(f"color:{CLASS_COLORS.get(row['classification'], '#e5e7eb')};font-size:12pt;font-weight:700;")
@@ -2800,10 +3120,12 @@ class MainWindow(QMainWindow):
         warning = "  ·  警告: 音の重なり" if row["overlap"] else ""
         event_flags = f"  ·  {row['event_flags']}" if row.get("event_flags") else ""
         cut_state = f"  ·  切断{row['cut_state']}" if row.get("cut_state") else ""
+        endpoint_warnings = "、".join(row.get("end_warning_labels", [])) or "なし"
         self.detail_metrics.setText(
             f"時刻 {format_seconds(row['time'])}  ·  {row['sample_id']}  ·  音種 {INSTRUMENT_LABELS.get(row.get('sound_type', 'other'), 'その他')}  ·  信頼度 {row['confidence']:.1f}%  ·  音量差 {row['gain_db']:+.2f} dB{warning}{event_flags}{cut_state}\n"
             f"正規化波形 {row['waveform'] * 100:.2f}%   生波形 {row['raw'] * 100:.2f}%   スペクトル {row['spectral'] * 100:.2f}%   "
             f"アタック {row['attack'] * 100:.2f}%   ボディ {row['body'] * 100:.2f}%   テール {row['tail'] * 100:.2f}%\n"
+            f"終端 {format_seconds(row['end'])} · {row.get('end_reason_label', '固定境界')} · 信頼度 {float(row.get('end_confidence', 0.0)) * 100.0:.0f}% · 警告 {endpoint_warnings}\n"
             f"判定プロファイル {profile_name}  ·  "
             f"波形基準 {float(profile.get('waveform_threshold', 0.95)):.3f}  ·  "
             f"スペクトル基準 {float(profile.get('spectral_threshold', 0.94)):.3f}  ·  "
@@ -2822,8 +3144,106 @@ class MainWindow(QMainWindow):
             self.preview_cut_button,
             self.accept_cut_button,
             self.exclude_cut_button,
+            self.terminal_duration_spin,
+            self.terminal_fix_button,
+            self.fixed_length_preview_button,
+            self.smart_end_preview_button,
         ):
             button.setEnabled(bool(enabled))
+
+    def _endpoint_preview_range(self, row: dict, mode: str) -> tuple[float, float] | None:
+        if not self.result:
+            return None
+        hit = next((item for item in self.result.hits if int(item.id) == int(row["id"])), None)
+        if hit is None or self.result.sample_rate <= 0:
+            return None
+        start = max(0.0, float(row.get("start", 0.0)))
+        current_end = max(start, float(row.get("end", start)))
+        effective = dict(getattr(hit, "effective_settings", {}) or {})
+        try:
+            hard_end = int(effective.get("hard_end_sample", hit.source_end))
+        except (TypeError, ValueError):
+            hard_end = int(hit.source_end)
+        fixed_end = max(start, hard_end / float(self.result.sample_rate))
+        if mode == "fixed":
+            return (start, fixed_end) if fixed_end > start else None
+        if mode != "smart":
+            return None
+        smart_enabled = bool(self.result.settings.get("smart_end", False))
+        smart_applied = bool(effective.get("smart_end_applied", False))
+        if not smart_enabled or not smart_applied or effective.get("manual_override"):
+            return None
+        return (start, current_end) if current_end > start else None
+
+    def _update_endpoint_preview_actions(self, row: dict | None) -> None:
+        if not row:
+            self.fixed_length_preview_button.setEnabled(False)
+            self.smart_end_preview_button.setEnabled(False)
+            self.terminal_status_label.setText("解析後に終端情報を表示")
+            return
+        fixed_range = self._endpoint_preview_range(row, "fixed")
+        smart_range = self._endpoint_preview_range(row, "smart")
+        self.fixed_length_preview_button.setEnabled(fixed_range is not None)
+        self.smart_end_preview_button.setEnabled(smart_range is not None)
+        fixed_text = "—" if fixed_range is None else f"{(fixed_range[1] - fixed_range[0]) * 1000.0:.1f}ms"
+        smart_text = "—" if smart_range is None else f"{(smart_range[1] - smart_range[0]) * 1000.0:.1f}ms"
+        if smart_range is None:
+            self.terminal_status_label.setText(
+                f"{row.get('end_reason_label', '固定境界')} {float(row.get('end_confidence', 0.0)) * 100.0:.0f}% · "
+                f"固定長 {fixed_text} · スマート終端は利用不可"
+            )
+        else:
+            self.terminal_status_label.setText(
+                f"{row.get('end_reason_label', '固定境界')} {float(row.get('end_confidence', 0.0)) * 100.0:.0f}% · "
+                f"固定長 {fixed_text} · スマート終端 {smart_text} · A/B試聴可能"
+            )
+
+    def _preview_endpoint_variant(self, mode: str) -> None:
+        hit_id = self._active_selection_id()
+        row = next((item for item in self.rows if item["id"] == hit_id), None)
+        preview_range = self._endpoint_preview_range(row, mode) if row else None
+        if not preview_range:
+            return
+        self.waveform.set_selected(int(hit_id))
+        self.waveform.play_range(*preview_range)
+        label = "固定長" if mode == "fixed" else "スマート終端"
+        self._log(f"ヒット{int(hit_id):03d}の{label}を試聴しています")
+
+    def _apply_terminal_fix(self) -> None:
+        hit_id = self._active_selection_id()
+        if hit_id is None or not self.result:
+            return
+        hit = next((item for item in self.result.hits if int(item.id) == int(hit_id)), None)
+        if hit is None:
+            return
+        try:
+            duration_ms = float(self.terminal_duration_spin.value())
+            source_start = int(hit.source_start)
+            effective = dict(getattr(hit, "effective_settings", {}) or {})
+            hard_end = int(effective.get("hard_end_sample", hit.source_end))
+            upper = max(source_start + 1, hard_end)
+            source_end = max(source_start + 1, min(upper, source_start + round(
+                self.result.sample_rate * duration_ms / 1000.0
+            )))
+        except (TypeError, ValueError):
+            return
+        settings = self.result.settings
+        overrides = settings.setdefault("terminal_overrides", {})
+        overrides[str(hit_id)] = {"source_end": source_end, "mode": "fixed"}
+        hit.source_end = source_end
+        hit.end_reason = "manual"
+        hit.end_confidence = 1.0
+        hit.end_warnings = []
+        effective["manual_override"] = True
+        effective["manual_source_end"] = source_end
+        effective["smart_end_requested"] = True
+        effective["smart_end_applied"] = True
+        hit.effective_settings = effective
+        if self.exported or self.json_edit.text().strip():
+            self._save_review_state()
+        self._refresh_result_view()
+        self._select_hit(int(hit_id))
+        self._log(f"ヒット{int(hit_id):03d}の終端を固定しました（{duration_ms:.1f}ms）")
 
     def _apply_hit_type(self) -> None:
         hit_id = self._active_selection_id()

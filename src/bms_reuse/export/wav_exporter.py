@@ -122,7 +122,17 @@ def write_hit_wavs(
         # raw stem would re-introduce the next hit that extraction excluded.
         end = min(audio.frame_count, max(hit.source_start, hit.source_end))
         source = audio.samples[hit.source_start:end]
-        missing = max(0, hit.sample_count - len(source))
+        effective_settings = getattr(hit, "effective_settings", {}) or {}
+        # Legacy/fixed extraction promises a window-sized representative.
+        # Smart-end extraction explicitly opts into the real source range.
+        smart_output = bool(effective_settings.get(
+            "smart_end_requested",
+            effective_settings.get(
+                "smart_end_applied",
+                effective_settings.get("enabled", False),
+            ),
+        ))
+        missing = max(0, hit.sample_count - len(source)) if not smart_output else 0
         if missing:
             if hasattr(source, "shape"):
                 import numpy as np

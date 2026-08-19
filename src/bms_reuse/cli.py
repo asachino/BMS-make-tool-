@@ -6,7 +6,9 @@ import argparse
 import json
 import sys
 import time
+from inspect import signature
 from pathlib import Path
+from typing import Mapping
 
 from .application import (
     analysis_result_from_dict,
@@ -24,6 +26,58 @@ from .export.bmson_exporter import write_bmson
 from .export.quality import validate_exports
 from .project.presets import load_preset, save_preset
 from .audio.loader import load_audio
+
+
+_ANALYZE_SETTING_KEYS = frozenset(signature(analyze_file).parameters) - {"path"}
+_SMART_END_ADVANCED_KEYS = frozenset({
+    "enabled", "apply_to_explicit", "min_tail_ms", "max_tail_ms", "silence_ms",
+    "silence_rms_db", "silence_peak_db", "frame_ms", "zero_crossing_ms",
+    "safety_margin_ms", "next_attack_margin_ms", "attack_window_ms",
+    "tail_min_ms", "tail_max_ms", "max_duration_ms",
+})
+
+
+def _preset_analysis_settings(values: Mapping[str, object]) -> dict:
+    """Convert GUI-compatible preset data to safe ``analyze_file`` kwargs.
+
+    Presets are also consumed by the GUI, so they may contain display-only
+    state such as ``smart_end_advanced``.  Keep its actual endpoint values
+    when it is a mapping, but never pass the GUI container or unknown metadata
+    to the backend.
+    """
+    settings = dict(values) if isinstance(values, Mapping) else {}
+    advanced = settings.pop("smart_end_advanced", None)
+    advanced_values: dict = {}
+    if isinstance(advanced, Mapping):
+        nested = advanced.get("settings")
+        if isinstance(nested, Mapping):
+            advanced_values.update(nested)
+        nested = advanced.get("smart_end_settings")
+        if isinstance(nested, Mapping):
+            advanced_values.update(nested)
+        advanced_values.update({
+            key: value
+            for key, value in advanced.items()
+            if key in _SMART_END_ADVANCED_KEYS
+        })
+    if advanced_values:
+        smart_settings = dict(settings.get("smart_end_settings") or {})
+        smart_settings.update({
+            key: value
+            for key, value in advanced_values.items()
+            if key in _SMART_END_ADVANCED_KEYS
+            and key not in {"enabled", "apply_to_explicit"}
+        })
+        settings["smart_end_settings"] = smart_settings
+        if "enabled" in advanced_values and "smart_end" not in settings:
+            settings["smart_end"] = advanced_values["enabled"]
+        if "apply_to_explicit" in advanced_values and "smart_end_apply_to_explicit" not in settings:
+            settings["smart_end_apply_to_explicit"] = advanced_values["apply_to_explicit"]
+    return {
+        key: value
+        for key, value in settings.items()
+        if key in _ANALYZE_SETTING_KEYS
+    }
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -65,6 +119,14 @@ def _parser() -> argparse.ArgumentParser:
     analyze.add_argument("--bms-channel", default="01", help="BMS event channel (default: BGM 01; 11+ for key-sounds)")
     analyze.add_argument("--fade-in-ms", type=float, default=0.0)
     analyze.add_argument("--fade-out-ms", type=float, default=0.0)
+    analyze.add_argument("--smart-end", action=argparse.BooleanOptionalAction, default=True, help="decay-aware safe endpoint detection (default: on)")
+    analyze.add_argument("--smart-end-apply-explicit", action="store_true", help="allow smart endpoint to shorten manual/pattern boundaries")
+    analyze.add_argument("--smart-end-min-tail-ms", type=float)
+    analyze.add_argument("--smart-end-max-tail-ms", type=float)
+    analyze.add_argument("--smart-end-silence-ms", type=float)
+    analyze.add_argument("--smart-end-safety-margin-ms", type=float)
+    analyze.add_argument("--smart-end-zero-crossing-ms", type=float)
+    analyze.add_argument("--smart-end-next-attack-margin-ms", type=float)
     analyze.add_argument("--loop-rule", choices=("off", "seconds", "beats", "bars", "points", "grid"), default="off")
     analyze.add_argument("--loop-seconds", type=float)
     analyze.add_argument("--loop-beats", type=float)
@@ -94,6 +156,14 @@ def _parser() -> argparse.ArgumentParser:
     batch.add_argument("--bms-channel", default="01", help="BMS event channel (default: BGM 01; 11+ for key-sounds)")
     batch.add_argument("--fade-in-ms", type=float, default=0.0)
     batch.add_argument("--fade-out-ms", type=float, default=0.0)
+    batch.add_argument("--smart-end", action=argparse.BooleanOptionalAction, default=True)
+    batch.add_argument("--smart-end-apply-explicit", action="store_true")
+    batch.add_argument("--smart-end-min-tail-ms", type=float)
+    batch.add_argument("--smart-end-max-tail-ms", type=float)
+    batch.add_argument("--smart-end-silence-ms", type=float)
+    batch.add_argument("--smart-end-safety-margin-ms", type=float)
+    batch.add_argument("--smart-end-zero-crossing-ms", type=float)
+    batch.add_argument("--smart-end-next-attack-margin-ms", type=float)
     batch.add_argument("--loop-rule", choices=("off", "seconds", "beats", "bars", "points", "grid"), default="off")
     batch.add_argument("--loop-seconds", type=float)
     batch.add_argument("--loop-beats", type=float)
@@ -136,6 +206,18 @@ def main(argv: list[str] | None = None) -> int:
                 bms_channel=args.bms_channel,
                 fade_in_ms=args.fade_in_ms,
                 fade_out_ms=args.fade_out_ms,
+                smart_end=args.smart_end,
+                smart_end_apply_to_explicit=args.smart_end_apply_explicit,
+                smart_end_settings={
+                    key: value for key, value in {
+                        "min_tail_ms": args.smart_end_min_tail_ms,
+                        "max_tail_ms": args.smart_end_max_tail_ms,
+                        "silence_ms": args.smart_end_silence_ms,
+                        "safety_margin_ms": args.smart_end_safety_margin_ms,
+                        "zero_crossing_ms": args.smart_end_zero_crossing_ms,
+                        "next_attack_margin_ms": args.smart_end_next_attack_margin_ms,
+                    }.items() if value is not None
+                },
                 loop_rule=args.loop_rule,
                 loop_seconds=args.loop_seconds,
                 loop_beats=args.loop_beats,
@@ -206,6 +288,18 @@ def main(argv: list[str] | None = None) -> int:
             "beat_division": args.beat_division,
             "fade_in_ms": args.fade_in_ms,
             "fade_out_ms": args.fade_out_ms,
+            "smart_end": args.smart_end,
+            "smart_end_apply_to_explicit": args.smart_end_apply_explicit,
+            "smart_end_settings": {
+                key: value for key, value in {
+                    "min_tail_ms": args.smart_end_min_tail_ms,
+                    "max_tail_ms": args.smart_end_max_tail_ms,
+                    "silence_ms": args.smart_end_silence_ms,
+                    "safety_margin_ms": args.smart_end_safety_margin_ms,
+                    "zero_crossing_ms": args.smart_end_zero_crossing_ms,
+                    "next_attack_margin_ms": args.smart_end_next_attack_margin_ms,
+                }.items() if value is not None
+            },
             "fast_compare": args.fast_compare,
             "bms_channel": args.bms_channel,
             "loop_rule": args.loop_rule,
@@ -223,13 +317,14 @@ def main(argv: list[str] | None = None) -> int:
             "automation_chop_floor": args.automation_chop_floor,
         }
         if args.preset_in:
-            preset = load_preset(args.preset_in)
+            preset = _preset_analysis_settings(load_preset(args.preset_in))
             defaults = {
                 "instrument": "kick", "threshold": 0.95, "spectral_threshold": 0.94,
                 "onset_threshold": 0.35, "min_separation_ms": 50.0, "pre_roll_ms": 5.0,
                 "window_ms": 800.0, "max_alignment_ms": 20.0, "bpm": None,
                 "offset": 0.0, "subdivision": 16, "beat_division": None, "fade_in_ms": 0.0,
                 "fade_out_ms": 0.0, "fast_compare": False, "bms_channel": "01",
+                "smart_end": True, "smart_end_apply_to_explicit": False, "smart_end_settings": {},
                 "loop_rule": "off", "loop_seconds": None, "loop_beats": None, "loop_bars": None,
                 "loop_start_sec": 0.0, "loop_points": None, "loop_pattern": None, "cut_plan": None,
                 "automation_detection": True, "automation_volume_threshold_db": 3.0,
@@ -245,6 +340,13 @@ def main(argv: list[str] | None = None) -> int:
                 for key, value in cli_values.items()
                 if key in defaults and value != defaults[key]
             })
+        # Keep the backend boundary safe even when a future preset loader
+        # preserves additional GUI metadata.
+        settings = {
+            key: value
+            for key, value in settings.items()
+            if key in _ANALYZE_SETTING_KEYS
+        }
         if args.preset_out:
             save_preset(args.preset_out, settings)
         result = analyze_file(
@@ -292,10 +394,10 @@ def main(argv: list[str] | None = None) -> int:
             "bms": str(args.bms) if args.bms else None,
             "bmson": str(args.bmson) if args.bmson else None,
         }
+        result.settings["exports"] = dict(exported)
         record_output_timing(result, time.perf_counter() - output_started)
+        result.settings["validation"] = validate_exports(result, exported)
         data = result.to_dict()
-        data["exports"] = exported
-        data["validation"] = validate_exports(result, exported)
         write_json(output, data)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
